@@ -10,13 +10,16 @@
 //! Serialization (codec vectors):
 //! - [`codec`] — JAM codec primitives (GP Appendix C)
 //! - [`types`] — protocol types with field-order codec + serde
-
+//!
+//! State trie:
+//! - [`trie`] — binary Merkle state trie + root (GP Appendix D)
 pub mod crypto;
 pub mod hexutil;
 
 #[macro_use]
 pub mod codec;
 pub mod types;
+pub mod trie;
 
 pub mod authorizations;
 pub mod history;

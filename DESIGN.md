@@ -196,13 +196,32 @@ The `Compact` set in the codec-vector types: all of `RefineLoad`,
 
 ---
 
+## 6c. State Merkle trie (GP Appendix D) — trie primitive DONE
+
+`src/trie.rs`. Passes all 11 `trie/trie.json` cases (`tests/trie.rs`): a
+key/value set maps to a 32-byte root.
+
+Binary Merkle trie, Blake2b-256, 64-byte nodes hashed to 32:
+- **leaf** (eq. 287): head `0b10_xxxxxx` embeds the value when `|v| ≤ 32` (low 6
+  bits = length), else `0b11000000` stores `H(v)`; body is `key[..31]` then the
+  value (zero-padded) or the value hash.
+- **branch** (eq. 286): head `left[0] & 0x7f` (top bit cleared = branch marker),
+  then `left[1..32]` and the full 32-byte `right`.
+- partition the set by key **bit at the current depth** (MSB-first within a byte),
+  recurse; empty set → the all-zero hash. Root = `merkle(kvs, 0)`.
+
+The result is order-independent (partition-by-bit), so input order does not matter.
+This is the primitive; **state-key derivation** and **per-component serialization**
+(to build `T(σ)` and check real `traces/` roots) are the next sub-step.
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **state roots** and then M1:
 
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
-2. **State Merkle trie** (GP Appendix D) — state key derivation + Blake2b trie
-   root. **NEXT.** Unlocks the `traces/` vectors (they check the real root).
+2. **State Merkle trie** (GP Appendix D) — trie primitive + root ✅ DONE (§6c,
+   passes `trie/trie.json`). Remaining: state-key derivation + per-component
+   serialization, to compute `T(σ)` and check `traces/` state roots.
 3. **PVM** — register machine + gas metering + host calls.
 4. **accumulate / reports** — depend on the PVM.
 5. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
