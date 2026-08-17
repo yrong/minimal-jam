@@ -211,8 +211,21 @@ Binary Merkle trie, Blake2b-256, 64-byte nodes hashed to 32:
   recurse; empty set → the all-zero hash. Root = `merkle(kvs, 0)`.
 
 The result is order-independent (partition-by-bit), so input order does not matter.
-This is the primitive; **state-key derivation** and **per-component serialization**
-(to build `T(σ)` and check real `traces/` roots) are the next sub-step.
+
+**Verified on real state (`traces/`).** `tests/traces.rs` rebuilds the `pre_state`
+and `post_state` roots of block-import traces from their key/value sets and checks
+them against the vector's `state_root`. GP **state keys are 31 bytes**; the trie
+takes 32-byte keys and a leaf stores `key[..31]`, so the 31→32 mapping appends a
+trailing `0x00` (`trie::state_key`) — confirmed against real pre/post roots. A
+lean 2-block `fallback` sample is vendored (traces JSON is ~600 KB/file, ~2.4 GB
+total, so the full set is not committed); set `JAM_TRACES_DIR` to a full checkout
+for an exhaustive run. Validated locally against 24 files across fallback/safrole/
+storage (48 root computations).
+
+Still pending for full block import: **state-key derivation** (the `C(...)`
+constructor per component + service accounts) and **per-component serialization**
+(σ → `T(σ)` via the codec), which let us check a post-state root after running the
+STFs rather than trusting the vector's keyvals.
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 

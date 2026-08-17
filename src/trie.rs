@@ -22,6 +22,18 @@ fn bit(k: &Key, i: usize) -> bool {
     (k[i >> 3] & (1 << (7 - (i & 7)))) != 0
 }
 
+/// Build a 32-byte trie key from a state key of up to 32 bytes.
+///
+/// GP state keys are 31 bytes; the trie operates on 32-byte keys and a leaf
+/// stores only the first 31 (`key[..31]`). The 31→32 mapping appends a trailing
+/// zero byte (verified against `traces/` pre/post state roots).
+pub fn state_key(bytes: &[u8]) -> Key {
+    assert!(bytes.len() <= 32, "state key longer than 32 bytes");
+    let mut k = [0u8; 32];
+    k[..bytes.len()].copy_from_slice(bytes);
+    k
+}
+
 /// Encode a leaf node (GP eq. 287).
 fn leaf(k: &Key, v: &[u8]) -> [u8; 64] {
     let mut node = [0u8; 64];
