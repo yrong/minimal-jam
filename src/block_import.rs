@@ -1,7 +1,7 @@
 //! Block-import state transitions wired onto the typed [`crate::state::State`]
 //! and a decoded [`crate::types::Block`].
 //!
-//! Implemented here (no PVM / bandersnatch required):
+//! Implemented here:
 //! - τ (C11): the posterior timeslot is the block's slot.
 //! - π (C13): validator activity records — author block count, ticket/preimage
 //!   counts, and per-credential guarantee/assurance counts, with epoch rotation.
@@ -10,8 +10,11 @@
 //! - β (C3): recent blocks — back-fill the prior head's state root, append the
 //!   accumulation-output root to the Keccak MMR, push the new head. The
 //!   accumulation-output root is a caller input (zero for blocks without work).
+//! - η (C6): entropy accumulator — `η₀' = blake2b(η₀ ⌢ banderout(entropy_source))`
+//!   with epoch rotation. `banderout` is the Bandersnatch IETF VRF output hash
+//!   (`ark-vrf` 0.1.0), extracted from the signature's output point.
 //!
-//! Not yet wired (need later slices): η/γ (bandersnatch VRF), reports-driven
+//! Not yet wired (need later slices): γ (safrole ring VRF), reports-driven
 //! core/service statistics, disputes ψ, and the accumulation that produces the
 //! non-trivial β accumulation-output root.
 
@@ -20,10 +23,12 @@ use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::{blake2b_256, mmr_append, mmr_super_peak};
 use crate::history::MAX_HISTORY;
 use crate::state::{
-    AuthPools, AuthQueues, BlockInfo, Mmr, RecentBlocks, ReportedWorkPackage, Statistics, TimeSlot,
-    ValidatorActivityRecord,
+    AuthPools, AuthQueues, BlockInfo, EntropyBuffer, Mmr, RecentBlocks, ReportedWorkPackage,
+    Statistics, TimeSlot, ValidatorActivityRecord,
 };
 use crate::types::{Block, EPOCH_LENGTH};
+use ark_serialize::CanonicalDeserialize;
+use ark_vrf::suites::bandersnatch::Output as VrfOutput;
 use jam_codec::Encode;
 
 /// τ' — posterior timeslot.
@@ -159,4 +164,37 @@ pub fn next_recent_blocks(pre: &RecentBlocks, block: &Block, accumulate_root: [u
         history,
         mmr: Mmr { peaks },
     }
+}
+
+/// `banderout` — the 32-byte Bandersnatch IETF VRF output hash of a 96-byte
+/// signature. The output point is the signature's first 32 bytes; the hash is
+/// `Output::hash()` per the JAM-era `ark-vrf` (0.1.0).
+pub fn bander_output(sig: &[u8; 96]) -> [u8; 32] {
+    let out = VrfOutput::deserialize_compressed(&sig[0..32])
+        .expect("valid bandersnatch VRF output point");
+    let hash = out.hash();
+    let bytes: &[u8] = hash.as_ref();
+    let mut y = [0u8; 32];
+    y.copy_from_slice(&bytes[..32]);
+    y
+}
+
+/// η' — entropy accumulator (GP §sealing/entropy).
+///
+/// `η₀' = blake2b(η₀ ⌢ banderout(entropy_source))`; on an epoch boundary the
+/// prior accumulator rotates into the history: `(η₁',η₂',η₃') = (η₀,η₁,η₂)`.
+pub fn next_entropy(pre: &EntropyBuffer, prior_slot: TimeSlot, block: &Block) -> EntropyBuffer {
+    let y = bander_output(&block.header.entropy_source.0);
+    let eta0 = pre.0[0].0;
+    let mut buf = eta0.to_vec();
+    buf.extend_from_slice(&y);
+    let new0 = Hex(blake2b_256(&buf));
+
+    let epoch_len = EPOCH_LENGTH as u32;
+    let out = if block.header.slot / epoch_len > prior_slot / epoch_len {
+        vec![new0, Hex(eta0), pre.0[1].clone(), pre.0[2].clone()]
+    } else {
+        vec![new0, pre.0[1].clone(), pre.0[2].clone(), pre.0[3].clone()]
+    };
+    FixedSeq(out)
 }

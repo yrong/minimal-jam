@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use minimal_jam::block_import::{
-    next_auth_pools, next_recent_blocks, next_statistics, next_timeslot,
+    next_auth_pools, next_entropy, next_recent_blocks, next_statistics, next_timeslot,
 };
 use jam_codec::Encode;
 use minimal_jam::hexutil::from_hex;
@@ -79,6 +79,10 @@ fn check_file(path: &Path) {
     // accumulation-output root is the empty (zero) hash.
     let beta = next_recent_blocks(&sigma.recent_blocks, &t.block, [0u8; 32]);
     assert_eq!(beta.encode(), *want(3), "{ctx}: β mismatch");
+
+    // η (C6): entropy accumulator (bandersnatch VRF output).
+    let eta = next_entropy(&sigma.entropy, sigma.timeslot, &t.block);
+    assert_eq!(eta.encode(), *want(6), "{ctx}: η mismatch");
 }
 
 /// Collect fallback trace files under `dir` (a directory that contains or is a

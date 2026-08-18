@@ -308,14 +308,24 @@ typed pre-`State`:
   head `{Hash(header), super-peak, 0, reported}`, cap at `MAX_HISTORY`. The
   accumulation-output root is a caller input — zero for blocks without work.
   `Hash(header) = blake2b(encode(header))` (confirmed against real β).
+- `next_entropy` — η': `η₀' = blake2b(η₀ ⌢ banderout(entropy_source))`, with
+  epoch rotation `(η₁',η₂',η₃') = (η₀,η₁,η₂)`. `banderout` is the Bandersnatch
+  IETF VRF output hash of the 96-byte `entropy_source` (output point = first 32
+  bytes → `Output::hash()`).
+
+**VRF version pin.** `banderout` is computed with **`ark-vrf` = 0.1.0**, not the
+latest 0.5.x. The output-hash derivation changed between them: 0.5.3 reproduces
+its *own* vectors but not the JAM 0.7.x traces; 0.1.0 reproduces the trace η
+exactly (`blake2b(η₀ ⌢ Output::hash(γ)) == η₀'`). Verified by calibration
+before wiring. This same crate will serve safrole (ring VRF) and seal later.
 
 Verified (`tests/block_import.rs`) against real **fallback** traces: recompute
-C11/C13/C1/C3 from the pre-state + block and assert they equal the post-state.
-Ran on the vendored sample and 12 fallback blocks via `JAM_TRACES_DIR`
-(crossing the epoch boundary at slot 12 → `vals_last` rotation; history fills
-and trims). Fallback is now fully covered except η (needs the bandersnatch VRF
-output). Other trace sets need transitions not yet wired (reports-driven
-core/service π, disputes ψ, safrole γ/η, accumulation).
+C11/C13/C1/C3/C6 from the pre-state + block and assert they equal the
+post-state. Ran on the vendored sample and 12 fallback blocks via
+`JAM_TRACES_DIR` (crossing the epoch boundary at slot 12 → `vals_last` and η
+rotation; β history fills and trims). **Fallback is now fully covered.** Other
+trace sets need transitions not yet wired (reports-driven core/service π,
+disputes ψ, safrole γ, accumulation).
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
@@ -324,8 +334,9 @@ To reach byte-exact **post-STF state roots** and then M1:
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
-3. **Block-import STFs** — partial ✅ (§6g: τ, π, α, β on fallback). Remaining:
-   η (bandersnatch VRF), disputes ψ, reports-driven core/service π, other sets.
+3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η).
+   Remaining: reports-driven core/service π, disputes ψ, safrole γ (ring VRF),
+   and the accumulation that feeds β — toward the other trace sets.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
 6. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
