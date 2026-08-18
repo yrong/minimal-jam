@@ -227,14 +227,38 @@ constructor per component + service accounts) and **per-component serialization*
 (σ → `T(σ)` via the codec), which let us check a post-state root after running the
 STFs rather than trusting the vector's keyvals.
 
+
+## 6d. State-key constructor `C(...)` (GP Appendix D §Serialization) — DONE
+
+`src/state_key.rs`. State is a map from **31-byte** keys to octet sequences.
+Three key forms:
+- `C(i)` — top-level component (chapter) `i`: `[i, 0, 0, …]`.
+- `C(i, s)` — chapter `i` scoped to service `s`: `[i, n0, 0, n1, 0, n2, 0, n3, 0, …]`
+  with `n = E4(s)`.
+- `C(s, h)` — service dictionary entry: `[n0, a0, n1, a1, n2, a2, n3, a3, a4, …, a26]`
+  with `n = E4(s)`, `a = blake2b(h)`. The three per-service dictionaries prefix a
+  4-byte marker to `h`: storage `2^32-1`, preimage `2^32-2`, request `= length`.
+
+**Verified against real traces** (`tests/state_key.rs`): every key in a trace's
+pre/post state is explained as a chapter `C(1..=16)`, an account `C(255, s)`, or
+a dict entry `C(s, ·)` whose service `s` has an account in the same state. Ran on
+the vendored `fallback` sample and, via `JAM_TRACES_DIR`, on 24 files across
+fallback/safrole/storage (the last exercises non-zero service ids). Unit tests
+pin the interleave layouts.
+
+Still pending for a full state root: **per-component value serialization**
+(σ → `T(σ)`), i.e. encoding each of α, φ, β, γ, ψ, η, ι, κ, λ, ρ, τ, χ, π, ϑ, ξ
+and the service accounts with their exact App. D rules. That is the next slice(s).
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **state roots** and then M1:
 
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
-2. **State Merkle trie** (GP Appendix D) — trie primitive + root ✅ DONE (§6c,
-   passes `trie/trie.json`). Remaining: state-key derivation + per-component
-   serialization, to compute `T(σ)` and check `traces/` state roots.
+2. **State Merkle trie + serialization** (GP Appendix D) — trie primitive ✅ DONE
+   (§6c, `trie.json` + real `traces/` roots), state-key `C(...)` ✅ DONE (§6d).
+   Remaining: per-component value serialization (σ → `T(σ)`) to reconstruct and
+   check `traces/` post-state roots after running the STFs.
 3. **PVM** — register machine + gas metering + host calls.
 4. **accumulate / reports** — depend on the PVM.
 5. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.

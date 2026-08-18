@@ -13,6 +13,7 @@
 //!
 //! State trie:
 //! - [`trie`] — binary Merkle state trie + root (GP Appendix D)
+//! - [`state_key`] — `C(...)` state-key constructor (GP Appendix D)
 pub mod crypto;
 pub mod hexutil;
 
@@ -20,6 +21,7 @@ pub mod hexutil;
 pub mod codec;
 pub mod types;
 pub mod trie;
+pub mod state_key;
 
 pub mod authorizations;
 pub mod history;
