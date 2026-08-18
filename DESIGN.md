@@ -327,6 +327,27 @@ rotation; β history fills and trims). **Fallback is now fully covered.** Other
 trace sets need transitions not yet wired (reports-driven core/service π,
 disputes ψ, safrole γ, accumulation).
 
+## 6h. Safrole STF (GP §6) — within-epoch slice DONE
+
+`src/safrole.rs` implements the isolated safrole STF against the `stf/safrole`
+vectors. This slice covers the crypto-free cases:
+- **`bad_slot`** — timeslot must be strictly monotonic (`slot > τ`).
+- **within-epoch advance** (no epoch change, empty tickets extrinsic): `τ' = slot`
+  and `η₀' = blake2b(η₀ ⌢ input.entropy)`. The isolated STF supplies the per-block
+  VRF output as `input.entropy`, so no bandersnatch crypto is needed here.
+
+Verified (`tests/safrole.rs`) against `enact-epoch-change-with-no-tickets-{1,2,3}`
+(τ 0→1, the `bad_slot` case τ 1→1, and τ 1→10).
+
+Deferred to the next safrole slice (needs `ark-vrf` ring + the Zcash SRS, which
+`jam-test-vectors` ships as `stf/safrole/zcash-srs-2-11-uncompressed.bin`,
+`ring_size = 6` for tiny):
+- **epoch transition**: validator rotation (ι→γ_k→κ→λ), γ_a reset, epoch/tickets
+  markers, η rotation.
+- **γ_s fallback keys** (`F(η₂', κ')`) and the **γ_z ring commitment** to the
+  next validators' bandersnatch keys.
+- **ticket processing**: ring-proof verification of `E_T`.
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
@@ -334,9 +355,9 @@ To reach byte-exact **post-STF state roots** and then M1:
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
-3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η).
-   Remaining: reports-driven core/service π, disputes ψ, safrole γ (ring VRF),
-   and the accumulation that feeds β — toward the other trace sets.
+3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η) and the
+   safrole within-epoch/bad-slot slice (§6h). Remaining: safrole epoch transition
+   + tickets (ring VRF), reports-driven core/service π, disputes ψ, accumulation.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
 6. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.

@@ -97,6 +97,7 @@ record!(TicketBody {
 
 /// Epoch sealing source: winning tickets or fallback keys.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TicketsOrKeys {
     Tickets(FixedSeq<TicketBody, EPOCH_LENGTH>),
     Keys(FixedSeq<H32, EPOCH_LENGTH>),

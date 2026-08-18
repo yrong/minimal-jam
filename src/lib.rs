@@ -28,5 +28,6 @@ pub mod block_import;
 
 pub mod authorizations;
 pub mod history;
+pub mod safrole;
 pub mod preimages;
 pub mod statistics;
