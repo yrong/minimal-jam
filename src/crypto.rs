@@ -32,6 +32,16 @@ pub fn keccak_256(data: &[u8]) -> Hash {
     r
 }
 
+/// Verify an Ed25519 signature (strict, RFC 8032). Returns false on any
+/// malformed key or signature, matching the JAM validity predicate.
+pub fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+        return false;
+    };
+    vk.verify_strict(message, &Signature::from_bytes(signature)).is_ok()
+}
+
 /// Append `item` to a Merkle Mountain Range of `peaks` (GP eq. for `A`).
 ///
 /// Peaks are little-endian by height: `peaks[n]` commits to `2^n` leaves.

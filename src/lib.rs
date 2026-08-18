@@ -32,3 +32,4 @@ pub mod history;
 pub mod safrole;
 pub mod preimages;
 pub mod statistics;
+pub mod disputes;

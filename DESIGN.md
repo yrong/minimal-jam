@@ -363,6 +363,35 @@ needing ring-proof *verification*. The id/accumulation all work; the exact
 VRF-input construction for `Public::verify` (beyond `ctx ‖ η₂' ‖ E4(attempt)`)
 is not yet reproduced, so an invalid proof cannot yet be rejected.
 
+## 6i. Disputes STF (GP §10) — DONE (28/28 vectors)
+
+`src/disputes.rs` implements the disputes STF against the `stf/disputes`
+vectors. Records verdicts over work-report validity (`ψ = good/bad/wonky/
+offenders`), punishes offenders, and clears availability assignments `ρ`.
+- **verdicts** — ordered/unique by report hash (`verdicts_not_sorted_unique`),
+  judgments ordered/unique by index (`judgements_not_sorted_unique`), disjoint
+  from prior `ψ` (`already_judged`); age is `⌊τ/E⌋` or one less
+  (`bad_judgement_age`) selecting `κ` or `λ`; each judgment index `< |k|`
+  (`bad_validator_index`) and Ed25519-valid (`bad_signature`) over
+  `ctx ‖ target` with `ctx ∈ {jam_valid, jam_invalid}` (**no `$`** — calibrated
+  against a real signature); positive tally ∈ {5→good, 0→bad, 2→wonky} else
+  `bad_vote_split`.
+- **culprits** — ordered/unique by key (`culprits_not_sorted_unique`), target in
+  `bad'` (`culprits_verdict_not_bad`), key a known validator (`bad_guarantor_key`)
+  and not already punished (`offender_already_reported`), signature over
+  `jam_guarantee ‖ target`; each bad verdict needs ≥2 culprits
+  (`not_enough_culprits`).
+- **faults** — ordered/unique by key (`faults_not_sorted_unique`), vote must
+  contradict the verdict (`fault_verdict_wrong`), key known (`bad_auditor_key`)
+  and unpunished, valid signature; each good verdict needs ≥1 fault
+  (`not_enough_faults`).
+- **output** — offenders marker = culprit keys then fault keys, extrinsic order.
+  `ψ.offenders'` (and good/bad/wonky) are stored **sorted**.
+- **`ρ` invalidation** — clears any core whose `blake2b(E(report))` matches a
+  bad/wonky verdict in this block.
+
+Ed25519 via `ed25519-dalek` (`verify_strict`). Verified on all 28 tiny vectors.
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
@@ -370,13 +399,13 @@ To reach byte-exact **post-STF state roots** and then M1:
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
-3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η) and the
-   safrole ticket path incl. epoch transition + ring commitment (§6h, 13/14).
+3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η), the
+   safrole ticket path (§6h, 13/14), and **disputes ψ** (§6i, 28/28).
    Remaining: `bad_ticket_proof` (ring-proof verify), reports-driven
-   core/service π, disputes ψ, accumulation.
+   core/service π, accumulation.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
-6. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
+6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅ (§6i), **assurances**.
 7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.
 
