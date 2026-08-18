@@ -11,11 +11,16 @@ use serde::{Deserialize, Serialize};
 pub const EPOCH_LENGTH: usize = 12;
 pub const VALIDATORS_COUNT: usize = 6;
 pub const VALIDATORS_SUPER_MAJORITY: usize = 5;
+pub const CORE_COUNT: usize = 2;
+pub const AUTH_QUEUE_SIZE: usize = 80;
+pub const ENTROPY_BUFFER_LEN: usize = 4;
 
 pub type H32 = Hex<32>;
 pub type H64 = Hex<64>;
 pub type H96 = Hex<96>;
 pub type H784 = Hex<784>;
+pub type H128 = Hex<128>;
+pub type H144 = Hex<144>;
 /// Availability bitfield: `ceil(core-count / 8)` = 1 byte for tiny.
 pub type Bitfield = Hex<1>;
 

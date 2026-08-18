@@ -22,6 +22,7 @@ pub mod codec;
 pub mod types;
 pub mod trie;
 pub mod state_key;
+pub mod state;
 
 pub mod authorizations;
 pub mod history;
