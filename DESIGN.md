@@ -155,44 +155,46 @@ file.
 
 ## 6b. JAM codec (GP Appendix C) — DONE
 
-`src/codec.rs` + `src/types.rs`. Passes all 15 `codec/tiny` vectors in **both**
-directions: `encode(from_json(.json)) == .bin` and `decode(.bin) == value` with
-no trailing bytes (`tests/codec.rs`).
+`src/bytes.rs` (wrappers) + `src/types.rs` (types). Passes all 15 `codec/tiny`
+vectors in **both** directions: `encode(from_json(.json)) == .bin` and
+`decode(.bin) == value` with no trailing bytes (`tests/codec.rs`).
+
+**Backed by `jam-codec`.** The binary codec is provided by the `jam-codec`
+crate (davxy/paritytech) — "a revision of SCALE with enhanced compact
+encoding", purpose-built for JAM and the same author as the test vectors. We
+originally hand-rolled the codec, then swapped to `jam-codec` after confirming
+its `Compact` and byte-sequence encodings match ours byte-for-byte across
+`0..=u64::MAX` and all boundaries. Types now use `#[derive(Encode, Decode)]`
+with `#[codec(compact)]` field attributes.
 
 Encoding rules (verified against the vectors and the reference `jam-types-py`):
+- **Fixed-width little-endian** for most integers (`u8/u16/u32/u64`, incl.
+  `ServiceId=u32`, `TimeSlot=u32`, `Gas=u64`, `CoreIndex/ValidatorIndex=u16`).
+- **General-natural (variable) compact** for (1) the length prefix of every
+  variable-length sequence (incl. `ByteSequence`), and (2) `#[codec(compact)]`
+  fields.
+- **Fixed-size sequences** (`SIZE(n)`) carry **no** length prefix; bounded/
+  unbounded sequences do.
+- `Option<T>` = 1 tag byte + value; `bool` = 1 byte; `CHOICE`/enum = 1 index
+  byte + payload; structs = fields in declaration order.
 
-- **Fixed-width little-endian** for most integers: `U8/U16/U32/U64`, and the
-  aliases `ServiceId=U32`, `TimeSlot=U32`, `Gas=U64`, `CoreIndex/ValidatorIndex=U16`.
-- **General-natural (variable) encoding** — `encode_nat`/`decode_nat` — is used in
-  two places only:
-  1. the **length prefix** of every variable-length sequence (incl. `ByteSequence`);
-  2. fields explicitly typed `Compact<…>` in the schema.
-- **Fixed-size sequences** (`SIZE(n)`) carry **no** length prefix; bounded/unbounded
-  sequences (`SEQUENCE OF`, `SIZE(0..n)`, `SIZE(1..n)`) do.
-- `Option<T>` = 1 tag byte (0/1) + value; `bool` = 1 byte; `CHOICE` = 1 tag byte +
-  payload; structs = fields in declaration order.
-
-**Key correction the vectors forced.** The GP note ("variable length used only
-for sequence prefixes") is *not* the whole story. Some scalar fields are
-`Compact`, and it is **per-field, not per-type**: `WorkResult.accumulate_gas`
-(a `Gas`) is fixed 8-byte, but `RefineLoad.gas_used` (also `Gas`) is `Compact`.
-First implementation used width-by-type and produced an 18-byte `RefineLoad`
-where the vector wanted 5. Fixed by consulting the reference type mappings.
-The `Compact` set in the codec-vector types: all of `RefineLoad`,
-`WorkReport.core_index`, `WorkReport.auth_gas_used`, `TicketEnvelope.attempt`,
-`TicketBody.attempt`. `WorkExecResult` tag numbers also follow the reference
-(0 ok, 1 out_of_gas, 2 panic, 3 bad_exports, 4 output_oversize, 5 bad_code,
-6 code_oversize), which differs from the ASN comment ordering.
+**Key correction the vectors forced.** `Compact` is **per-field, not per-type**:
+`WorkResult.accumulate_gas` (a `Gas`) is fixed 8-byte, but `RefineLoad.gas_used`
+(also `Gas`) is `Compact`. Our first hand-rolled version used width-by-type and
+produced an 18-byte `RefineLoad` where the vector wanted 5. The `Compact` set:
+all of `RefineLoad`, `WorkReport.core_index`, `WorkReport.auth_gas_used`,
+`TicketEnvelope.attempt`, `TicketBody.attempt`. `WorkExecResult` variant indices
+follow the reference (0 ok, 1 out_of_gas, 2 panic, 3 bad_exports,
+4 output_oversize, 5 bad_code, 6 code_oversize).
 
 **Design choices.**
-- `Codec` trait (`encode_to`/`decode`) with a `codec_struct!` macro that emits
-  the struct, its serde derives, and a field-order codec in one place — the field
-  list is the single source of truth for both JSON and binary.
-- `Hex<const N>` for fixed byte arrays (no prefix), `Blob` for `ByteSequence`
-  (prefixed), `FixedSeq<T, N>` for `SIZE(n)` sequences, `Compact` for variable
-  scalars. Each pairs a serde impl (hex string / number / array) with a `Codec`
-  impl, so the same value type verifies both directions.
-- Byte types keep raw `[u8; N]`/`Vec<u8>`; only JSON boundaries use hex strings.
+- `#[derive(Encode, Decode, Serialize, Deserialize)]` on every type via a small
+  `record!` macro — the field list is the single source of truth for both JSON
+  and binary.
+- Dual-purpose wrappers in `src/bytes.rs`: `Hex<N>` (fixed byte array, no
+  prefix), `Blob` (`ByteSequence`, prefixed), `FixedSeq<T, N>` (`SIZE(n)`), and
+  `Null` (empty CHOICE payload). Each pairs a serde impl (hex/number/array) with
+  `jam-codec` `Encode`/`Decode`, so one value type verifies both directions.
 
 ---
 

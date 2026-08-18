@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use minimal_jam::codec::{Codec, Reader};
+use jam_codec::{Decode, Encode};
+use minimal_jam::bytes::decode_all;
 use minimal_jam::hexutil::from_hex;
 use minimal_jam::state::{
     AccumulatedQueue, AuthPools, AuthQueues, AvailabilityAssignments, DisputesRecords,
@@ -34,15 +35,13 @@ struct Trace {
     post_state: Snapshot,
 }
 
-/// Decode `T` from `bytes`, require full consumption, and re-encode to the same bytes.
-fn round_trip<T: Codec>(bytes: &[u8], ctx: &str) {
-    let mut r = Reader::new(bytes);
-    let v = T::decode(&mut r).unwrap_or_else(|e| panic!("{ctx}: decode: {e}"));
-    assert_eq!(r.remaining(), 0, "{ctx}: trailing bytes");
+/// Decode `T` from `bytes` (full consumption) and re-encode to the same bytes.
+fn round_trip<T: Encode + Decode>(bytes: &[u8], ctx: &str) {
+    let v = decode_all::<T>(bytes).unwrap_or_else(|e| panic!("{ctx}: decode: {e:?}"));
     assert_eq!(v.encode(), bytes, "{ctx}: re-encode mismatch");
 }
 
-fn check_chapter<T: Codec>(map: &BTreeMap<String, Vec<u8>>, i: u8, ctx: &str) {
+fn check_chapter<T: Encode + Decode>(map: &BTreeMap<String, Vec<u8>>, i: u8, ctx: &str) {
     let key = hex::encode(chapter(i));
     let value = map
         .get(&key)

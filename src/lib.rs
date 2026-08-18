@@ -7,18 +7,19 @@
 //! - [`preimages`] — preimage provision (GP §12)
 //! - [`history`] — recent blocks + Keccak MMR (GP §7)
 //!
-//! Serialization (codec vectors):
-//! - [`codec`] — JAM codec primitives (GP Appendix C)
-//! - [`types`] — protocol types with field-order codec + serde
+//! Serialization (codec vectors), via `jam-codec`:
+//! - [`bytes`] — dual serde + jam-codec wrapper types (`Hex`, `Blob`, `FixedSeq`)
+//! - [`types`] — protocol types with `#[derive(Encode, Decode)]` + serde
 //!
-//! State trie:
-//! - [`trie`] — binary Merkle state trie + root (GP Appendix D)
-//! - [`state_key`] — `C(...)` state-key constructor (GP Appendix D)
+//! State (GP Appendix D):
+//! - [`trie`] — binary Merkle state trie + root
+//! - [`state_key`] — `C(...)` state-key constructor
+//! - [`state`] — full σ assembly, serialization, and merklization
+//! - [`block_import`] — block-import STFs (τ, π, α) on typed state
 pub mod crypto;
 pub mod hexutil;
 
-#[macro_use]
-pub mod codec;
+pub mod bytes;
 pub mod types;
 pub mod trie;
 pub mod state_key;

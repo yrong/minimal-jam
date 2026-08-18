@@ -6,11 +6,12 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
 
-use minimal_jam::codec::{Codec, Reader};
+use jam_codec::{Decode, Encode};
+use minimal_jam::bytes::decode_all;
 use minimal_jam::types::*;
 use serde::de::DeserializeOwned;
 
-fn check<T: Codec + DeserializeOwned + PartialEq + Debug>(name: &str) {
+fn check<T: Encode + Decode + DeserializeOwned + PartialEq + Debug>(name: &str) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/codec");
     let json = fs::read_to_string(dir.join(format!("{name}.json")))
         .unwrap_or_else(|e| panic!("read {name}.json: {e}"));
@@ -23,9 +24,7 @@ fn check<T: Codec + DeserializeOwned + PartialEq + Debug>(name: &str) {
     assert_eq!(value.encode(), bin, "encode mismatch: {name}");
 
     // Decode direction: bytes must round-trip to the same value, fully consumed.
-    let mut r = Reader::new(&bin);
-    let decoded = T::decode(&mut r).unwrap_or_else(|e| panic!("decode {name}: {e}"));
-    assert_eq!(r.remaining(), 0, "trailing bytes: {name}");
+    let decoded = decode_all::<T>(&bin).unwrap_or_else(|e| panic!("decode {name}: {e:?}"));
     assert_eq!(decoded, value, "decode mismatch: {name}");
 }
 

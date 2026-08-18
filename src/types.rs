@@ -1,10 +1,12 @@
 //! JAM protocol types for the codec vectors (GP / `lib/jam-types.asn`).
 //!
-//! Field order mirrors the ASN.1 schema exactly — the codec encodes fields in
-//! declaration order. Fixed-size sequences use [`FixedSeq`]; variable ones use
-//! `Vec`. Tiny chain-spec sizes are baked into the `FixedSeq` const parameters.
+//! Binary encoding is derived via `jam-codec` (`#[derive(Encode, Decode)]`);
+//! fields marked `#[codec(compact)]` use the JAM general-natural encoding, all
+//! other integers are fixed-length little-endian. Fixed-size sequences use
+//! [`FixedSeq`]; variable ones use `Vec`. JSON (serde) is derived in parallel.
 
-use crate::codec::{Blob, Codec, CodecError, Compact, FixedSeq, Hex, Reader};
+use crate::bytes::{Blob, FixedSeq, Hex, Null};
+use jam_codec::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 /// Tiny chain-spec sizes for fixed-length sequences.
@@ -24,9 +26,17 @@ pub type H144 = Hex<144>;
 /// Availability bitfield: `ceil(core-count / 8)` = 1 byte for tiny.
 pub type Bitfield = Hex<1>;
 
+macro_rules! record {
+    ($(#[$m:meta])* $name:ident { $($(#[$fm:meta])* $field:ident : $ty:ty),* $(,)? }) => {
+        $(#[$m])*
+        #[derive(Clone, Debug, PartialEq, Encode, Decode, Serialize, Deserialize)]
+        pub struct $name { $($(#[$fm])* pub $field: $ty),* }
+    };
+}
+
 // --- Refine context / work package ----------------------------------------
 
-codec_struct!(RefineContext {
+record!(RefineContext {
     anchor: H32,
     state_root: H32,
     beefy_root: H32,
@@ -35,17 +45,17 @@ codec_struct!(RefineContext {
     prerequisites: Vec<H32>,
 });
 
-codec_struct!(ImportSpec {
+record!(ImportSpec {
     tree_root: H32,
     index: u16,
 });
 
-codec_struct!(ExtrinsicSpec {
+record!(ExtrinsicSpec {
     hash: H32,
     len: u32,
 });
 
-codec_struct!(WorkItem {
+record!(WorkItem {
     service: u32,
     code_hash: H32,
     refine_gas_limit: u64,
@@ -56,7 +66,7 @@ codec_struct!(WorkItem {
     extrinsic: Vec<ExtrinsicSpec>,
 });
 
-codec_struct!(WorkPackage {
+record!(WorkPackage {
     auth_code_host: u32,
     auth_code_hash: H32,
     context: RefineContext,
@@ -67,12 +77,8 @@ codec_struct!(WorkPackage {
 
 // --- Work report ----------------------------------------------------------
 
-/// Serializes to `null` (used as the payload of unit `WorkExecResult` variants).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Null;
-
-/// `WorkExecResult` CHOICE: tag byte + payload (only `ok` carries data).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `WorkExecResult` CHOICE — tag byte + payload (only `ok` carries data).
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkExecResult {
     Ok(Blob),
@@ -84,44 +90,20 @@ pub enum WorkExecResult {
     CodeOversize(Null),
 }
 
-impl Codec for WorkExecResult {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        match self {
-            WorkExecResult::Ok(b) => {
-                out.push(0);
-                b.encode_to(out);
-            }
-            WorkExecResult::OutOfGas(_) => out.push(1),
-            WorkExecResult::Panic(_) => out.push(2),
-            WorkExecResult::BadExports(_) => out.push(3),
-            WorkExecResult::OutputOversize(_) => out.push(4),
-            WorkExecResult::BadCode(_) => out.push(5),
-            WorkExecResult::CodeOversize(_) => out.push(6),
-        }
-    }
-    fn decode(r: &mut Reader) -> Result<Self, CodecError> {
-        Ok(match r.u8()? {
-            0 => WorkExecResult::Ok(Blob::decode(r)?),
-            1 => WorkExecResult::OutOfGas(Null),
-            2 => WorkExecResult::Panic(Null),
-            3 => WorkExecResult::BadExports(Null),
-            4 => WorkExecResult::OutputOversize(Null),
-            5 => WorkExecResult::BadCode(Null),
-            6 => WorkExecResult::CodeOversize(Null),
-            b => return Err(CodecError(format!("invalid WorkExecResult tag {b}"))),
-        })
-    }
-}
-
-codec_struct!(RefineLoad {
-    gas_used: Compact,
-    imports: Compact,
-    extrinsic_count: Compact,
-    extrinsic_size: Compact,
-    exports: Compact,
+record!(RefineLoad {
+    #[codec(compact)]
+    gas_used: u64,
+    #[codec(compact)]
+    imports: u16,
+    #[codec(compact)]
+    extrinsic_count: u16,
+    #[codec(compact)]
+    extrinsic_size: u32,
+    #[codec(compact)]
+    exports: u16,
 });
 
-codec_struct!(WorkResult {
+record!(WorkResult {
     service_id: u32,
     code_hash: H32,
     payload_hash: H32,
@@ -130,7 +112,7 @@ codec_struct!(WorkResult {
     refine_load: RefineLoad,
 });
 
-codec_struct!(WorkPackageSpec {
+record!(WorkPackageSpec {
     hash: H32,
     length: u32,
     erasure_root: H32,
@@ -138,17 +120,19 @@ codec_struct!(WorkPackageSpec {
     exports_count: u16,
 });
 
-codec_struct!(SegmentRootLookupItem {
+record!(SegmentRootLookupItem {
     work_package_hash: H32,
     segment_tree_root: H32,
 });
 
-codec_struct!(WorkReport {
+record!(WorkReport {
     package_spec: WorkPackageSpec,
     context: RefineContext,
-    core_index: Compact,
+    #[codec(compact)]
+    core_index: u16,
     authorizer_hash: H32,
-    auth_gas_used: Compact,
+    #[codec(compact)]
+    auth_gas_used: u64,
     auth_output: Blob,
     segment_root_lookup: Vec<SegmentRootLookupItem>,
     results: Vec<WorkResult>,
@@ -156,44 +140,46 @@ codec_struct!(WorkReport {
 
 // --- Tickets --------------------------------------------------------------
 
-codec_struct!(TicketEnvelope {
-    attempt: Compact,
+record!(TicketEnvelope {
+    #[codec(compact)]
+    attempt: u8,
     signature: H784,
 });
 
-codec_struct!(TicketBody {
+record!(TicketBody {
     id: H32,
-    attempt: Compact,
+    #[codec(compact)]
+    attempt: u8,
 });
 
 // --- Disputes -------------------------------------------------------------
 
-codec_struct!(Judgement {
+record!(Judgement {
     vote: bool,
     index: u16,
     signature: H64,
 });
 
-codec_struct!(Verdict {
+record!(Verdict {
     target: H32,
     age: u32,
     votes: FixedSeq<Judgement, VALIDATORS_SUPER_MAJORITY>,
 });
 
-codec_struct!(Culprit {
+record!(Culprit {
     target: H32,
     key: H32,
     signature: H64,
 });
 
-codec_struct!(Fault {
+record!(Fault {
     target: H32,
     vote: bool,
     key: H32,
     signature: H64,
 });
 
-codec_struct!(DisputesExtrinsic {
+record!(DisputesExtrinsic {
     verdicts: Vec<Verdict>,
     culprits: Vec<Culprit>,
     faults: Vec<Fault>,
@@ -201,24 +187,24 @@ codec_struct!(DisputesExtrinsic {
 
 // --- Preimages / assurances / guarantees ----------------------------------
 
-codec_struct!(Preimage {
+record!(Preimage {
     requester: u32,
     blob: Blob,
 });
 
-codec_struct!(AvailAssurance {
+record!(AvailAssurance {
     anchor: H32,
     bitfield: Bitfield,
     validator_index: u16,
     signature: H64,
 });
 
-codec_struct!(ValidatorSignature {
+record!(ValidatorSignature {
     validator_index: u16,
     signature: H64,
 });
 
-codec_struct!(ReportGuarantee {
+record!(ReportGuarantee {
     report: WorkReport,
     slot: u32,
     signatures: Vec<ValidatorSignature>,
@@ -226,18 +212,18 @@ codec_struct!(ReportGuarantee {
 
 // --- Header / block -------------------------------------------------------
 
-codec_struct!(EpochMarkValidatorKeys {
+record!(EpochMarkValidatorKeys {
     bandersnatch: H32,
     ed25519: H32,
 });
 
-codec_struct!(EpochMark {
+record!(EpochMark {
     entropy: H32,
     tickets_entropy: H32,
     validators: FixedSeq<EpochMarkValidatorKeys, VALIDATORS_COUNT>,
 });
 
-codec_struct!(Header {
+record!(Header {
     parent: H32,
     parent_state_root: H32,
     extrinsic_hash: H32,
@@ -250,7 +236,7 @@ codec_struct!(Header {
     seal: H96,
 });
 
-codec_struct!(Extrinsic {
+record!(Extrinsic {
     tickets: Vec<TicketEnvelope>,
     preimages: Vec<Preimage>,
     guarantees: Vec<ReportGuarantee>,
@@ -258,7 +244,7 @@ codec_struct!(Extrinsic {
     disputes: DisputesExtrinsic,
 });
 
-codec_struct!(Block {
+record!(Block {
     header: Header,
     extrinsic: Extrinsic,
 });

@@ -12,7 +12,7 @@
 //! η/γ (bandersnatch VRF), and the core/service statistics driven by reports.
 
 use crate::authorizations::MAX_POOL;
-use crate::codec::FixedSeq;
+use crate::bytes::FixedSeq;
 use crate::state::{AuthPools, AuthQueues, Statistics, TimeSlot, ValidatorActivityRecord};
 use crate::types::{Block, EPOCH_LENGTH};
 
@@ -86,7 +86,7 @@ pub fn next_auth_pools(pools: &AuthPools, queues: &AuthQueues, block: &Block) ->
 
         // Drop the authorizer consumed by each report guaranteed on core c.
         for g in &block.extrinsic.guarantees {
-            if g.report.core_index.0 as usize == c {
+            if g.report.core_index as usize == c {
                 if let Some(p) = pool.iter().position(|h| *h == g.report.authorizer_hash) {
                     pool.remove(p);
                 }

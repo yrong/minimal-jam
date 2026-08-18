@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use minimal_jam::block_import::{next_auth_pools, next_statistics, next_timeslot};
-use minimal_jam::codec::Codec;
+use jam_codec::Encode;
 use minimal_jam::hexutil::from_hex;
 use minimal_jam::state::State;
 use minimal_jam::state_key::{chapter, StateKey};
