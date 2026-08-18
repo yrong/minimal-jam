@@ -441,6 +441,29 @@ Not exercised by vectors, so omitted: erasure-shard count, the lookup-anchor
 ancestor header-chain proof, and duplicate-package sources outside this STF's
 state (ready queue ϑ, accumulated ξ).
 
+
+## 6l. PVM interpreter (GP Appendix A, Ψ) — DONE (311/311 vectors)
+
+`src/pvm.rs` (+ `src/pvm_exec.rs`) is a 64-bit PolkaVM interpreter: 13
+registers, paged 2³²-byte memory, per-basic-block gas charging.
+- **deblob** — `E(|j|) ‖ E₁(z) ‖ E(|c|) ‖ jump-table ‖ code ‖ bitmask` (lenient:
+  a non-terminated final block traps on out-of-bounds rather than being
+  rejected). `skip` = octets to the next opcode (bitmask padded with 1s).
+- **basic blocks** — starts = `{0}` ∪ positions after terminators; a start past
+  the code counts (a trap), so falling/jumping off the end lands and panics.
+- **gas** — each block charges its instruction count on entry; insufficient →
+  out-of-gas with the counter unchanged.
+- **memory** — `< 2¹⁶` panics; an unmapped page faults (recoverable); a write to
+  a mapped read-only page panics.
+- **instructions** — all opcodes 0–230 across the 13 argument classes
+  (immediates sign-extended, offsets relative to the instruction). Jumps/branches
+  validate against basic-block starts; `djump` to `0xffff0000` halts.
+- exit statuses: halt, panic, out-of-gas, page-fault (address), host-call (id);
+  the returned pc is the instruction that caused the exit.
+
+**Two-register opcode cluster uses GP 0.5.4 numbering** (the vectors' target):
+`sbrk` occupies 101, shifting count/clz/ctz/sign-extend/reverse to 102–111.
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
@@ -452,8 +475,8 @@ To reach byte-exact **post-STF state roots** and then M1:
    safrole ticket path (§6h, 13/14), **disputes ψ** (§6i, 28/28),
    **assurances** (§6j, 10/10), and **reports** (§6k, 42/42). Remaining:
    `bad_ticket_proof` (ring-proof verify) and accumulation.
-4. **PVM** — register machine + gas metering + host calls.
-5. **accumulate** — depends on the PVM.
+4. **PVM** — ✅ DONE (§6l, 311/311). 64-bit interpreter, gas, page faults.
+5. **accumulate** — depends on the PVM (host calls into service accounts).
 6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅, ~~assurances~~ ✅, ~~reports~~ ✅.
 7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.
