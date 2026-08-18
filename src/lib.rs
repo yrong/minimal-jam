@@ -22,6 +22,7 @@ pub mod hexutil;
 pub mod bytes;
 pub mod types;
 pub mod trie;
+pub mod ring;
 pub mod state_key;
 pub mod state;
 pub mod block_import;

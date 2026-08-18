@@ -1,0 +1,48 @@
+//! Bandersnatch ring commitment (GP safrole `γ_z`), via `ark-vrf` 0.1.0 + the
+//! Zcash SRS. The commitment is the `RingVerifierKey` commitment over the
+//! validators' bandersnatch public keys; invalid/absent keys use the padding
+//! point. Tiny uses `ring_size = 6`.
+
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_vrf::suites::bandersnatch::{PcsParams, Public, RingProofParams};
+use std::sync::LazyLock;
+
+/// KZG SRS (Zcash powers-of-tau, uncompressed) shipped by the test vectors.
+const SRS: &[u8] = include_bytes!("zcash-srs-2-11-uncompressed.bin");
+
+/// Tiny chain-spec ring size (number of validators).
+const RING_SIZE: usize = 6;
+
+/// A `BandersnatchRingCommitment` is 144 bytes.
+pub type RingCommitmentBytes = [u8; 144];
+
+static PARAMS: LazyLock<RingProofParams> = LazyLock::new(|| {
+    let pcs =
+        PcsParams::deserialize_uncompressed_unchecked(&mut &SRS[..]).expect("valid Zcash SRS");
+    RingProofParams::from_pcs_params(RING_SIZE, pcs).expect("ring params from SRS")
+});
+
+/// Ring commitment `γ_z` over the given 32-byte bandersnatch public keys.
+///
+/// A key that is not a valid point (e.g. a nulled/offender key) is replaced by
+/// the ring padding point, per the JAM/`ark-vrf` convention.
+pub fn ring_commitment(keys: &[[u8; 32]]) -> RingCommitmentBytes {
+    let padding = RingProofParams::padding_point();
+    let pts: Vec<_> = keys
+        .iter()
+        .map(|k| {
+            Public::deserialize_compressed(&k[..])
+                .map(|p| p.0)
+                .unwrap_or(padding)
+        })
+        .collect();
+
+    let commitment = PARAMS.verifier_key(&pts).commitment();
+    let mut out = Vec::with_capacity(144);
+    commitment
+        .serialize_compressed(&mut out)
+        .expect("serialize ring commitment");
+    let mut bytes = [0u8; 144];
+    bytes.copy_from_slice(&out);
+    bytes
+}

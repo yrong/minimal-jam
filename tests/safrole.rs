@@ -38,3 +38,13 @@ fn safrole_within_epoch_vectors() {
     run("enact-epoch-change-with-no-tickets-2"); // tau 1 -> slot 1: bad_slot
     run("enact-epoch-change-with-no-tickets-3"); // tau 1 -> slot 10
 }
+
+#[test]
+fn safrole_epoch_change_vectors() {
+    // Epoch transitions with no tickets: rotation, γ_z ring commitment,
+    // γ_s fallback keys, η rotation, epoch marker.
+    run("enact-epoch-change-with-no-tickets-4"); // epoch 0 -> 1
+    run("enact-epoch-change-with-padding-1");
+    run("skip-epochs-1"); // skips multiple epochs
+    run("skip-epoch-tail-1");
+}

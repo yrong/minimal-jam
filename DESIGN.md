@@ -327,26 +327,31 @@ rotation; β history fills and trims). **Fallback is now fully covered.** Other
 trace sets need transitions not yet wired (reports-driven core/service π,
 disputes ψ, safrole γ, accumulation).
 
-## 6h. Safrole STF (GP §6) — within-epoch slice DONE
+## 6h. Safrole STF (GP §6) — no-ticket path DONE (ring commitment included)
 
 `src/safrole.rs` implements the isolated safrole STF against the `stf/safrole`
-vectors. This slice covers the crypto-free cases:
+vectors, for empty-ticket blocks:
 - **`bad_slot`** — timeslot must be strictly monotonic (`slot > τ`).
-- **within-epoch advance** (no epoch change, empty tickets extrinsic): `τ' = slot`
-  and `η₀' = blake2b(η₀ ⌢ input.entropy)`. The isolated STF supplies the per-block
-  VRF output as `input.entropy`, so no bandersnatch crypto is needed here.
+- **within-epoch advance**: `τ' = slot`, `η₀' = blake2b(η₀ ⌢ input.entropy)`. The
+  isolated STF supplies the per-block VRF output as `input.entropy`.
+- **epoch transition**:
+  - validator rotation `λ'=κ`, `κ'=γ_k`, `γ_k'=Φ(ι)` where `Φ` nulls any
+    validator whose ed25519 key is in `post_offenders`;
+  - **γ_z' ring commitment** to `γ_k'`'s bandersnatch keys — `src/ring.rs` via
+    `ark-vrf` 0.1.0 + the vendored Zcash SRS (`ring_size = 6`), nulled keys → the
+    ring padding point;
+  - **γ_s' fallback keys** `F(η₂', κ')` (`idx = LE(blake2b(r ‖ E4(i))[..4]) mod V`);
+  - η rotation `(η₁',η₂',η₃') = (η₀,η₁,η₂)`, `γ_a' = []`, and the epoch marker
+    `(η₀, η₁, γ_k' keys)`.
 
-Verified (`tests/safrole.rs`) against `enact-epoch-change-with-no-tickets-{1,2,3}`
-(τ 0→1, the `bad_slot` case τ 1→1, and τ 1→10).
+Each piece was calibrated against a real vector before wiring (γ_z byte-exact,
+F exact). Verified (`tests/safrole.rs`) on all seven no-ticket vectors:
+`enact-epoch-change-with-no-tickets-{1..4}`, `-with-padding-1` (offender
+nullification), `skip-epochs-1`, `skip-epoch-tail-1`.
 
-Deferred to the next safrole slice (needs `ark-vrf` ring + the Zcash SRS, which
-`jam-test-vectors` ships as `stf/safrole/zcash-srs-2-11-uncompressed.bin`,
-`ring_size = 6` for tiny):
-- **epoch transition**: validator rotation (ι→γ_k→κ→λ), γ_a reset, epoch/tickets
-  markers, η rotation.
-- **γ_s fallback keys** (`F(η₂', κ')`) and the **γ_z ring commitment** to the
-  next validators' bandersnatch keys.
-- **ticket processing**: ring-proof verification of `E_T`.
+Deferred: **ticket processing** — ring-proof verification of a non-empty `E_T`
+(the `publish-tickets-*` vectors), the `Z(γ_a)` winning-ticket sealing branch,
+and the winning-tickets marker.
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
@@ -356,8 +361,9 @@ To reach byte-exact **post-STF state roots** and then M1:
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
 3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η) and the
-   safrole within-epoch/bad-slot slice (§6h). Remaining: safrole epoch transition
-   + tickets (ring VRF), reports-driven core/service π, disputes ψ, accumulation.
+   safrole no-ticket path incl. epoch transition + ring commitment (§6h).
+   Remaining: safrole ticket processing (ring-proof verify), reports-driven
+   core/service π, disputes ψ, accumulation.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
 6. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
