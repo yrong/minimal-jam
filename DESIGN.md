@@ -392,6 +392,21 @@ offenders`), punishes offenders, and clears availability assignments `ρ`.
 
 Ed25519 via `ed25519-dalek` (`verify_strict`). Verified on all 28 tiny vectors.
 
+## 6j. Assurances STF (GP §11) — DONE (10/10 vectors)
+
+`src/assurances.rs` processes the availability-assurances extrinsic against
+`ρ†` (pending assignments) and `κ`.
+- each assurance anchored on the parent (`bad_attestation_parent`), index
+  `< |κ|` (`bad_validator_index`), assurers strictly ordered/unique
+  (`not_sorted_or_unique_assurers`), Ed25519-valid (`bad_signature`) over
+  `jam_available ‖ blake2b(E(parent, bitfield))` (**no `$`**, calibrated), and
+  every set bit maps to an engaged core (`core_not_engaged`);
+- a report is **available** when a strict two-thirds super-majority assure its
+  core (`3·count > 2·|κ|`) — those reports are removed from `ρ` and returned
+  as `reported`;
+- reports past the timeout (`slot ≥ timeout + 5`, `C_assurancetimeoutperiod`)
+  are cleared too, but **not** reported. Bitfield is LSB-first (core 0 = bit 0).
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
@@ -400,12 +415,12 @@ To reach byte-exact **post-STF state roots** and then M1:
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
 3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η), the
-   safrole ticket path (§6h, 13/14), and **disputes ψ** (§6i, 28/28).
-   Remaining: `bad_ticket_proof` (ring-proof verify), reports-driven
-   core/service π, accumulation.
+   safrole ticket path (§6h, 13/14), **disputes ψ** (§6i, 28/28), and
+   **assurances** (§6j, 10/10). Remaining: `bad_ticket_proof` (ring-proof
+   verify), reports-driven core/service π, accumulation.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
-6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅ (§6i), **assurances**.
+6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅ (§6i), ~~assurances~~ ✅ (§6j).
 7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.
 

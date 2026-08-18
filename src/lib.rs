@@ -33,3 +33,4 @@ pub mod safrole;
 pub mod preimages;
 pub mod statistics;
 pub mod disputes;
+pub mod assurances;
