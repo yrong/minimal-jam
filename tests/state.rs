@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use minimal_jam::codec::{Codec, Reader};
 use minimal_jam::hexutil::from_hex;
 use minimal_jam::state::{
-    AuthPools, AuthQueues, AvailabilityAssignments, DisputesRecords, EntropyBuffer, Privileges,
-    TimeSlot, ValidatorSet,
+    AccumulatedQueue, AuthPools, AuthQueues, AvailabilityAssignments, DisputesRecords,
+    EntropyBuffer, LastAccout, Privileges, ReadyQueue, RecentBlocks, SafroleState, ServiceInfo,
+    Statistics, TimeSlot, ValidatorSet,
 };
-use minimal_jam::state_key::chapter;
+use minimal_jam::state_key::{chapter, service_account};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -66,6 +67,23 @@ fn check_snapshot(snap: &Snapshot, ctx: &str) {
     check_chapter::<AvailabilityAssignments>(&map, 10, ctx); // ρ
     check_chapter::<TimeSlot>(&map, 11, ctx); // τ
     check_chapter::<Privileges>(&map, 12, ctx); // χ
+    check_chapter::<RecentBlocks>(&map, 3, ctx); // β
+    check_chapter::<SafroleState>(&map, 4, ctx); // γ
+    check_chapter::<Statistics>(&map, 13, ctx); // π
+    check_chapter::<ReadyQueue>(&map, 14, ctx); // ϑ
+    check_chapter::<AccumulatedQueue>(&map, 15, ctx); // ξ
+    check_chapter::<LastAccout>(&map, 16, ctx); // last accout
+
+    // Service account metadata: keys C(255, s).
+    for kv in &snap.keyvals {
+        let kb = from_hex(&kv.key);
+        if kb[0] == 255 {
+            let s = u32::from_le_bytes([kb[1], kb[3], kb[5], kb[7]]);
+            if hex::encode(service_account(s)) == kv.key.trim_start_matches("0x") {
+                round_trip::<ServiceInfo>(&from_hex(&kv.value), &format!("{ctx} C(255,{s})"));
+            }
+        }
+    }
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

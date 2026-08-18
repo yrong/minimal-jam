@@ -246,30 +246,37 @@ the vendored `fallback` sample and, via `JAM_TRACES_DIR`, on 24 files across
 fallback/safrole/storage (the last exercises non-zero service ids). Unit tests
 pin the interleave layouts.
 
-## 6e. State value serialization (GP Appendix D §Serialization) — batch DONE
+## 6e. State value serialization (GP Appendix D §Serialization) — all chapters DONE
 
-`src/state.rs`. Encodes state components to their `C(i)` values. Verified by
+`src/state.rs`. Encodes every state component to its `C(i)` value, verified by
 **byte-exact round-trip** against real trace state (`tests/state.rs`): decode a
-chapter's value from a trace, re-encode, assert identical. Covered this slice:
-- `C(1)` α auth pools — per-core length-prefixed pool (`FixedSeq<Vec<H32>, 2>`)
-- `C(2)` φ auth queues — `FixedSeq<FixedSeq<H32,80>, 2>` (no prefixes)
-- `C(5)` ψ disputes records — four length-prefixed hash sequences
-- `C(6)` η entropy — `FixedSeq<H32, 4>`
-- `C(7)/C(8)/C(9)` ι/κ/λ validator sets — `FixedSeq<ValidatorData, 6>`, where
-  `ValidatorData = bandersnatch(32)+ed25519(32)+bls(144)+metadata(128)` (no prefix)
-- `C(10)` ρ availability assignments — `FixedSeq<Option<AvailabilityAssignment>, 2>`
-  (`AvailabilityAssignment = WorkReport + timeout`, reusing the codec `WorkReport`)
-- `C(11)` τ timeslot — `E4`
-- `C(12)` χ privileges — manager, per-core assigners, delegator, registrar, always-acc
+component's value from a trace, re-encode, assert identical. Covers all
+top-level chapters and service-account metadata:
+- `C(1)` α auth pools; `C(2)` φ auth queues; `C(5)` ψ disputes records
+- `C(3)` β recent blocks — `history: Vec<BlockInfo>` + `mmr: Vec<Option<hash>>`
+- `C(4)` γ safrole — pending validators + ring commitment(144) + `TicketsOrKeys`
+  (tag: tickets/keys) + ticket accumulator
+- `C(6)` η entropy; `C(7)/C(8)/C(9)` ι/κ/λ validator sets (`ValidatorData` =
+  bandersnatch+ed25519+bls(144)+metadata(128))
+- `C(10)` ρ availability assignments (`WorkReport` + timeout)
+- `C(11)` τ timeslot; `C(12)` χ privileges
+- `C(13)` π statistics — validator records (fixed u32) + core/service records
+  (**`Compact`**, confirmed against the storage traces)
+- `C(14)` ϑ ready queue; `C(15)` ξ accumulated; `C(16)` last-accout
+- `C(255, s)` service account — `ServiceInfo` (89 bytes: version + code hash +
+  5×u64 + 4×u32), matching the vectors' 0.7.x layout (not GP 0.8 main)
 
-Confirmed: state numerics are **fixed-length** (GP App. D note), unlike the
-block/extrinsic codec which uses `Compact` in places. Ran on the vendored
-fallback sample and, via `JAM_TRACES_DIR`, on 24 files across fallback/safrole/
-storage (the storage set exercises `ρ` with real work reports).
+Key findings: most state numerics are fixed-length, **except** the statistics
+core/service activity records which use `Compact`. The account layout is the
+`jam-types.asn` `ServiceInfo`, confirming the vectors track ~0.7.x rather than
+GP 0.8. Ran on the vendored fallback sample and, via `JAM_TRACES_DIR`, on 24
+files across fallback/safrole/storage (which exercise β MMR, γ tickets, π
+service stats, and ρ/ϑ with real work reports).
 
-Still pending for a full state root: **β, γ, π, ϑ, ξ, last-accout, and service
-accounts** (metadata + storage/preimage/request dict values). Once those land,
-`state_root(T(σ)) == state_root` closes the loop and enables post-STF root checks.
+Not yet covered: the opaque per-service **dictionary values** (storage/preimage
+blobs are identity; request values are `var{[E4(slot)]}`) — they cannot be
+classified from the hashed key alone, so they are handled when building `T(σ)`
+from a decoded σ, the next step toward `state_root(T(σ)) == state_root`.
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
@@ -277,8 +284,9 @@ To reach byte-exact **state roots** and then M1:
 
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
 2. **State Merkle trie + serialization** (GP Appendix D) — trie ✅ (§6c), state-key
-   `C(...)` ✅ (§6d), value serialization batch ✅ (§6e: α, φ, ψ, η, ι/κ/λ, ρ, τ, χ).
-   Remaining: β, γ, π, ϑ, ξ, last-accout, service accounts → then full `T(σ)` root.
+   `C(...)` ✅ (§6d), value serialization ✅ (§6e: all chapters `C(1..=16)` +
+   accounts `C(255,s)`). Remaining: assemble `T(σ)` from a decoded σ (incl.
+   service-dict values) → full state root and post-STF root checks.
 3. **PVM** — register machine + gas metering + host calls.
 4. **accumulate / reports** — depend on the PVM.
 5. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
