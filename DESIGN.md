@@ -303,13 +303,19 @@ typed pre-`State`:
   there are no reports/preimages).
 - `next_auth_pools` — α' per core: drop consumed authorizers, enqueue the
   slot's queued authorizer, keep the newest `MAX_POOL`.
+- `next_recent_blocks` — β': back-fill the prior head's posterior state root
+  with `H_r`, append the accumulation-output root to the Keccak MMR, push a new
+  head `{Hash(header), super-peak, 0, reported}`, cap at `MAX_HISTORY`. The
+  accumulation-output root is a caller input — zero for blocks without work.
+  `Hash(header) = blake2b(encode(header))` (confirmed against real β).
 
 Verified (`tests/block_import.rs`) against real **fallback** traces: recompute
-C11/C13/C1 from the pre-state + block and assert they equal the post-state.
+C11/C13/C1/C3 from the pre-state + block and assert they equal the post-state.
 Ran on the vendored sample and 12 fallback blocks via `JAM_TRACES_DIR`
-(crossing the epoch boundary at slot 12, exercising `vals_last` rotation).
-Restricted to fallback because other sets need transitions not yet wired
-(β accumulation root, η/γ bandersnatch, reports-driven core/service stats).
+(crossing the epoch boundary at slot 12 → `vals_last` rotation; history fills
+and trims). Fallback is now fully covered except η (needs the bandersnatch VRF
+output). Other trace sets need transitions not yet wired (reports-driven
+core/service π, disputes ψ, safrole γ/η, accumulation).
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
@@ -318,8 +324,8 @@ To reach byte-exact **post-STF state roots** and then M1:
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
-3. **Block-import STFs** — partial ✅ (§6g: τ, π, α on fallback). Remaining:
-   β (accumulation-output root), disputes ψ, and reports-driven core/service π.
+3. **Block-import STFs** — partial ✅ (§6g: τ, π, α, β on fallback). Remaining:
+   η (bandersnatch VRF), disputes ψ, reports-driven core/service π, other sets.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
 6. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.

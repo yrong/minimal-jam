@@ -7,14 +7,24 @@
 //!   counts, and per-credential guarantee/assurance counts, with epoch rotation.
 //! - α (C1): authorizer pools — drop consumed authorizers, enqueue the slot's
 //!   queued authorizer, keep the newest `MAX_POOL`.
+//! - β (C3): recent blocks — back-fill the prior head's state root, append the
+//!   accumulation-output root to the Keccak MMR, push the new head. The
+//!   accumulation-output root is a caller input (zero for blocks without work).
 //!
-//! Not yet wired (need later slices): β (needs the accumulation-output root),
-//! η/γ (bandersnatch VRF), and the core/service statistics driven by reports.
+//! Not yet wired (need later slices): η/γ (bandersnatch VRF), reports-driven
+//! core/service statistics, disputes ψ, and the accumulation that produces the
+//! non-trivial β accumulation-output root.
 
 use crate::authorizations::MAX_POOL;
-use crate::bytes::FixedSeq;
-use crate::state::{AuthPools, AuthQueues, Statistics, TimeSlot, ValidatorActivityRecord};
+use crate::bytes::{FixedSeq, Hex};
+use crate::crypto::{blake2b_256, mmr_append, mmr_super_peak};
+use crate::history::MAX_HISTORY;
+use crate::state::{
+    AuthPools, AuthQueues, BlockInfo, Mmr, RecentBlocks, ReportedWorkPackage, Statistics, TimeSlot,
+    ValidatorActivityRecord,
+};
 use crate::types::{Block, EPOCH_LENGTH};
+use jam_codec::Encode;
 
 /// τ' — posterior timeslot.
 pub fn next_timeslot(block: &Block) -> TimeSlot {
@@ -103,4 +113,50 @@ pub fn next_auth_pools(pools: &AuthPools, queues: &AuthQueues, block: &Block) ->
     }
 
     FixedSeq(out)
+}
+
+/// β' — recent blocks history (GP §7).
+///
+/// Back-fill the prior head's posterior state root with `H_r`, append the
+/// accumulation-output root to the Keccak MMR, then push a new head carrying
+/// the block header hash, the MMR super-peak, a zero (not-yet-known) state
+/// root, and the reported work packages. Capped at `MAX_HISTORY`.
+///
+/// `accumulate_root` is the accumulation-output root; for blocks without work
+/// reports it is the empty root (zero hash).
+pub fn next_recent_blocks(pre: &RecentBlocks, block: &Block, accumulate_root: [u8; 32]) -> RecentBlocks {
+    let mut history = pre.history.clone();
+    if let Some(last) = history.last_mut() {
+        last.state_root = block.header.parent_state_root.clone();
+    }
+
+    let mut peaks: Vec<Option<[u8; 32]>> = pre.mmr.peaks.iter().map(|p| p.as_ref().map(|h| h.0)).collect();
+    mmr_append(&mut peaks, accumulate_root);
+    let beefy_root = mmr_super_peak(&peaks);
+
+    let reported = block
+        .extrinsic
+        .guarantees
+        .iter()
+        .map(|g| ReportedWorkPackage {
+            hash: g.report.package_spec.hash.clone(),
+            exports_root: g.report.package_spec.exports_root.clone(),
+        })
+        .collect();
+
+    history.push(BlockInfo {
+        header_hash: Hex(blake2b_256(&block.header.encode())),
+        beefy_root: Hex(beefy_root),
+        state_root: Hex([0u8; 32]),
+        reported,
+    });
+    if history.len() > MAX_HISTORY {
+        history.drain(0..history.len() - MAX_HISTORY);
+    }
+
+    let peaks = peaks.iter().map(|p| p.map(Hex)).collect();
+    RecentBlocks {
+        history,
+        mmr: Mmr { peaks },
+    }
 }
