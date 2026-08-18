@@ -289,18 +289,39 @@ Verified on the vendored fallback sample and, via `JAM_TRACES_DIR`, on 24 files
 across fallback/safrole/storage — **48 state snapshots** (pre+post), all matching.
 This closes the state-serialization + merklization loop.
 
+## 6g. Block-import STF wiring (fallback) — DONE
+
+`src/block_import.rs` runs the implemented transitions against a decoded
+[`types::Block`] (the trace `block` field deserializes straight into it) and a
+typed pre-`State`:
+- `next_timeslot` — τ' = block slot
+- `next_statistics` — π' validator records (author blocks; ticket/preimage
+  counts; per-credential guarantees/assurances), with epoch rotation of
+  `vals_curr` → `vals_last`. Core/service records carried through (exact when
+  there are no reports/preimages).
+- `next_auth_pools` — α' per core: drop consumed authorizers, enqueue the
+  slot's queued authorizer, keep the newest `MAX_POOL`.
+
+Verified (`tests/block_import.rs`) against real **fallback** traces: recompute
+C11/C13/C1 from the pre-state + block and assert they equal the post-state.
+Ran on the vendored sample and 12 fallback blocks via `JAM_TRACES_DIR`
+(crossing the epoch boundary at slot 12, exercising `vals_last` rotation).
+Restricted to fallback because other sets need transitions not yet wired
+(β accumulation root, η/γ bandersnatch, reports-driven core/service stats).
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
 
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
-2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE: trie (§6c),
-   state-key `C(...)` (§6d), value serialization (§6e), full σ assembly +
-   `root()` (§6f). `root(σ) == state_root` on real traces.
-3. **PVM** — register machine + gas metering + host calls.
-4. **accumulate / reports** — depend on the PVM.
-5. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
-6. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
+2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
+   `root(σ) == state_root` on real traces.
+3. **Block-import STFs** — partial ✅ (§6g: τ, π, α on fallback). Remaining:
+   β (accumulation-output root), disputes ψ, and reports-driven core/service π.
+4. **PVM** — register machine + gas metering + host calls.
+5. **accumulate / reports** — depend on the PVM.
+6. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.
+7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.
 
 The STF subsystems (§4) and the codec (§6b) are the value-level semantics and
