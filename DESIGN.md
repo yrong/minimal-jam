@@ -273,20 +273,30 @@ GP 0.8. Ran on the vendored fallback sample and, via `JAM_TRACES_DIR`, on 24
 files across fallback/safrole/storage (which exercise β MMR, γ tickets, π
 service stats, and ρ/ϑ with real work reports).
 
-Not yet covered: the opaque per-service **dictionary values** (storage/preimage
-blobs are identity; request values are `var{[E4(slot)]}`) — they cannot be
-classified from the hashed key alone, so they are handled when building `T(σ)`
-from a decoded σ, the next step toward `state_root(T(σ)) == state_root`.
+## 6f. Full state assembly + merklization (GP Appendix D) — DONE
+
+`State` in `src/state.rs` is the full σ: typed top-level chapters + service
+accounts, plus per-service dictionary entries carried opaquely as
+`(state-key, value)` (their keys are one-way hashes, which GP App. D notes an
+implementation need not invert). It provides:
+- `serialize()` → the `T(σ)` dictionary (state-key → value bytes)
+- `root()` → the 32-byte state root (serialize, pad keys 31→32, merklize)
+- `from_entries()` → parse a serialized `T(σ)` back into a typed σ
+
+End-to-end (`tests/state_root.rs`): parse a real trace's state into σ, assert
+`serialize()` reproduces the exact key/value set, and `root() == state_root`.
+Verified on the vendored fallback sample and, via `JAM_TRACES_DIR`, on 24 files
+across fallback/safrole/storage — **48 state snapshots** (pre+post), all matching.
+This closes the state-serialization + merklization loop.
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
-To reach byte-exact **state roots** and then M1:
+To reach byte-exact **post-STF state roots** and then M1:
 
 1. **JAM codec** (GP Appendix C) — ✅ DONE (§6b). Passes `codec/tiny`.
-2. **State Merkle trie + serialization** (GP Appendix D) — trie ✅ (§6c), state-key
-   `C(...)` ✅ (§6d), value serialization ✅ (§6e: all chapters `C(1..=16)` +
-   accounts `C(255,s)`). Remaining: assemble `T(σ)` from a decoded σ (incl.
-   service-dict values) → full state root and post-STF root checks.
+2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE: trie (§6c),
+   state-key `C(...)` (§6d), value serialization (§6e), full σ assembly +
+   `root()` (§6f). `root(σ) == state_root` on real traces.
 3. **PVM** — register machine + gas metering + host calls.
 4. **accumulate / reports** — depend on the PVM.
 5. **safrole** (bandersnatch RingVRF), **disputes** (ed25519/BLS), **assurances**.

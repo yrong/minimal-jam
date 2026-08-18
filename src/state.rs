@@ -238,3 +238,133 @@ codec_struct!(ServiceInfo {
     last_accumulation_slot: u32,
     parent_service: u32,
 });
+
+// --- Full state σ: assembly of T(σ) and its root -------------------------
+
+use crate::crypto::Hash;
+use crate::state_key::{chapter, service_account, StateKey};
+use crate::trie::{state_key, state_root};
+use std::collections::BTreeMap;
+
+/// Decode `T` from exactly `bytes` (no trailing).
+fn decode_full<T: Codec>(bytes: &[u8]) -> Result<T, CodecError> {
+    let mut r = Reader::new(bytes);
+    let v = T::decode(&mut r)?;
+    if r.remaining() != 0 {
+        return Err(CodecError("trailing bytes in state value".into()));
+    }
+    Ok(v)
+}
+
+/// The full JAM state σ, sufficient to reconstruct `T(σ)` and its root.
+///
+/// Top-level chapters and service-account metadata are typed. Per-service
+/// dictionary entries (storage/preimage/request) are carried opaquely as
+/// `(state-key, value)` because their keys are one-way hashes (GP App. D notes
+/// implementations need not know the pre-image keys).
+pub struct State {
+    pub auth_pools: AuthPools,             // C(1) α
+    pub auth_queues: AuthQueues,           // C(2) φ
+    pub recent_blocks: RecentBlocks,       // C(3) β
+    pub safrole: SafroleState,             // C(4) γ
+    pub disputes: DisputesRecords,         // C(5) ψ
+    pub entropy: EntropyBuffer,            // C(6) η
+    pub staging_validators: ValidatorSet,  // C(7) ι
+    pub active_validators: ValidatorSet,   // C(8) κ
+    pub previous_validators: ValidatorSet, // C(9) λ
+    pub avail: AvailabilityAssignments,    // C(10) ρ
+    pub timeslot: TimeSlot,                // C(11) τ
+    pub privileges: Privileges,            // C(12) χ
+    pub statistics: Statistics,            // C(13) π
+    pub ready: ReadyQueue,                 // C(14) ϑ
+    pub accumulated: AccumulatedQueue,     // C(15) ξ
+    pub last_accout: LastAccout,           // C(16)
+    pub accounts: Vec<(u32, ServiceInfo)>, // C(255, s)
+    pub service_dict: Vec<(StateKey, Vec<u8>)>, // opaque C(s, ·)
+}
+
+impl State {
+    /// Serialize σ to the `T(σ)` dictionary (state-key → value bytes).
+    pub fn serialize(&self) -> BTreeMap<StateKey, Vec<u8>> {
+        let mut m = BTreeMap::new();
+        m.insert(chapter(1), self.auth_pools.encode());
+        m.insert(chapter(2), self.auth_queues.encode());
+        m.insert(chapter(3), self.recent_blocks.encode());
+        m.insert(chapter(4), self.safrole.encode());
+        m.insert(chapter(5), self.disputes.encode());
+        m.insert(chapter(6), self.entropy.encode());
+        m.insert(chapter(7), self.staging_validators.encode());
+        m.insert(chapter(8), self.active_validators.encode());
+        m.insert(chapter(9), self.previous_validators.encode());
+        m.insert(chapter(10), self.avail.encode());
+        m.insert(chapter(11), self.timeslot.encode());
+        m.insert(chapter(12), self.privileges.encode());
+        m.insert(chapter(13), self.statistics.encode());
+        m.insert(chapter(14), self.ready.encode());
+        m.insert(chapter(15), self.accumulated.encode());
+        m.insert(chapter(16), self.last_accout.encode());
+        for (s, info) in &self.accounts {
+            m.insert(service_account(*s), info.encode());
+        }
+        for (k, v) in &self.service_dict {
+            m.insert(*k, v.clone());
+        }
+        m
+    }
+
+    /// Merklize σ into its 32-byte state root (GP Appendix D).
+    pub fn root(&self) -> Hash {
+        let entries: Vec<([u8; 32], Vec<u8>)> = self
+            .serialize()
+            .into_iter()
+            .map(|(k, v)| (state_key(&k), v))
+            .collect();
+        state_root(&entries)
+    }
+
+    /// Parse a serialized `T(σ)` dictionary back into a typed σ.
+    pub fn from_entries(entries: &[(StateKey, Vec<u8>)]) -> Result<Self, CodecError> {
+        let mut ch: BTreeMap<u8, &Vec<u8>> = BTreeMap::new();
+        let mut accounts = Vec::new();
+        let mut service_dict = Vec::new();
+        for (k, v) in entries {
+            if (1..=16).contains(&k[0]) && *k == chapter(k[0]) {
+                ch.insert(k[0], v);
+            } else if k[0] == 255 {
+                let s = u32::from_le_bytes([k[1], k[3], k[5], k[7]]);
+                if *k == service_account(s) {
+                    accounts.push((s, decode_full::<ServiceInfo>(v)?));
+                    continue;
+                }
+                service_dict.push((*k, v.clone()));
+            } else {
+                service_dict.push((*k, v.clone()));
+            }
+        }
+        let get = |i: u8| -> Result<&Vec<u8>, CodecError> {
+            ch.get(&i)
+                .copied()
+                .ok_or_else(|| CodecError(format!("missing chapter C({i})")))
+        };
+        Ok(State {
+            auth_pools: decode_full(get(1)?)?,
+            auth_queues: decode_full(get(2)?)?,
+            recent_blocks: decode_full(get(3)?)?,
+            safrole: decode_full(get(4)?)?,
+            disputes: decode_full(get(5)?)?,
+            entropy: decode_full(get(6)?)?,
+            staging_validators: decode_full(get(7)?)?,
+            active_validators: decode_full(get(8)?)?,
+            previous_validators: decode_full(get(9)?)?,
+            avail: decode_full(get(10)?)?,
+            timeslot: decode_full(get(11)?)?,
+            privileges: decode_full(get(12)?)?,
+            statistics: decode_full(get(13)?)?,
+            ready: decode_full(get(14)?)?,
+            accumulated: decode_full(get(15)?)?,
+            last_accout: decode_full(get(16)?)?,
+            accounts,
+            service_dict,
+        })
+    }
+}
