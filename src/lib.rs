@@ -36,3 +36,4 @@ pub mod disputes;
 pub mod assurances;
 pub mod reports;
 pub mod pvm;
+pub mod accumulate;

@@ -464,6 +464,30 @@ registers, paged 2³²-byte memory, per-basic-block gas charging.
 **Two-register opcode cluster uses GP 0.5.4 numbering** (the vectors' target):
 `sbrk` occupies 101, shifting count/clz/ctz/sign-extend/reverse to 102–111.
 
+
+## 6m. Accumulate STF (GP §12) — queue management (14/30 vectors)
+
+`src/accumulate.rs` implements the **history + queuing** half of accumulation:
+- newly-available reports partitioned into **immediate** (no prerequisites and
+  empty segment-root lookup) and **deferred** (dependency-bearing);
+- the queue-editing `E` (drop accumulated reports + resolved deps), the priority
+  queue `Q` (iteratively surface reports whose deps are all met), and `srmap`;
+- the **ready ring buffer** `ϑ` and **accumulated ring buffer** `ξ` are shifted
+  per GP eq. finalstateaccumulation (new entries at `slot mod E`, gap slots
+  cleared, oldest dropped);
+- `π_S` holds only this block's accumulation stats (empty when nothing runs);
+- output = the accumulation-output keccak root (zero for an empty block).
+
+Passes the 14 vectors where **no report is accumulated** (all deps unsatisfied,
+or no reports): `no_available_reports`, `enqueue_and_unlock_*`,
+`enqueue_self_referential-*`, `queues_are_shifted-2`, `ready_queue_editing-1`,
+`work_for_ejected_service-1`.
+
+**Deferred (execution half):** invoking each service's `accumulate` logic in the
+PVM with the host-call ABI (storage/info/transfer/new/upgrade/…), deferred
+transfers, and the resulting service-account mutations + non-zero output root.
+The remaining 16 vectors accumulate ≥1 report and need this.
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
@@ -476,7 +500,8 @@ To reach byte-exact **post-STF state roots** and then M1:
    **assurances** (§6j, 10/10), and **reports** (§6k, 42/42). Remaining:
    `bad_ticket_proof` (ring-proof verify) and accumulation.
 4. **PVM** — ✅ DONE (§6l, 311/311). 64-bit interpreter, gas, page faults.
-5. **accumulate** — depends on the PVM (host calls into service accounts).
+5. **accumulate** — 🚧 queue management done (§6m, 14/30); execution half
+   (PVM host-call ABI + deferred transfers) remains.
 6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅, ~~assurances~~ ✅, ~~reports~~ ✅.
 7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.
