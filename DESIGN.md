@@ -407,6 +407,40 @@ Ed25519 via `ed25519-dalek` (`verify_strict`). Verified on all 28 tiny vectors.
 - reports past the timeout (`slot ≥ timeout + 5`, `C_assurancetimeoutperiod`)
   are cleared too, but **not** reported. Bitfield is LSB-first (core 0 = bit 0).
 
+## 6k. Reports STF (GP §11) — DONE (42/42 vectors)
+
+`src/reports.rs` validates the guarantees extrinsic and assigns accepted
+work-reports to cores — the largest STF (26 error codes).
+- **guarantor assignment** `src/reports.rs`: `P(v, η₂', t) = R(FY-shuffle(
+  [⌊i/3⌋], η₂'), ⌊(t mod E)/rotation⌋)` with the GP Fisher-Yates + `Q`
+  sequence-from-hash. Current rotation uses `κ'/η₂'`; the previous rotation
+  uses `κ'/η₂'` (same epoch) or `λ'/η₃'`, selected by the guarantee slot.
+- **guarantees** ordered/unique by core (`out_of_order_guarantee`), core
+  `< CORE_COUNT` (`bad_core_index`); slot in `[rotation·(⌊τ'/rot⌋-1), τ']`
+  (`future_report_slot`, `report_epoch_before_last`); credentials 2–3, sorted
+  by index (`not_sorted_or_unique_guarantors`, `insufficient_guarantees`);
+  each guarantor assigned to the core (`wrong_assignment`), index `< |κ'|`
+  (`bad_validator_index`), unbanned (`banned_validator`), Ed25519-valid over
+  `jam_guarantee ‖ blake2b(E(report))` (`bad_signature`).
+- **work-report**: non-empty results (`missing_work_results`), free core
+  (`core_engaged`), authorizer in pool (`core_unauthorized`), anchor in recent
+  history with matching state/beefy roots (`anchor_not_recent`,
+  `bad_state_root`, `bad_beefy_mmr_root`), lookup-anchor age
+  (`lookup_anchor_not_recent`), ≤8 deps (`too_many_dependencies`), per-service
+  account/code/min-gas (`bad_service_id`, `bad_code_hash`,
+  `service_item_gas_too_low`), per-report gas ≤ 10M (`work_report_gas_too_high`),
+  output ≤ 48 KiB (`work_report_too_big`), no duplicate package
+  (`duplicate_package`), prerequisites resolvable (`dependency_missing`), and
+  segment-root lookups matching (`segment_root_lookup_invalid`).
+- **transition**: assign each report to `ρ[core]` with `timeout = τ'`; update
+  core stats (imports/exports/extrinsic size+count/gas from refine loads,
+  `bundle_size` = package length) and per-service refinement stats. Output
+  `reported` (sorted by package hash) + `reporters` (sorted Ed25519 keys).
+
+Not exercised by vectors, so omitted: erasure-shard count, the lookup-anchor
+ancestor header-chain proof, and duplicate-package sources outside this STF's
+state (ready queue ϑ, accumulated ξ).
+
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
 To reach byte-exact **post-STF state roots** and then M1:
@@ -415,12 +449,12 @@ To reach byte-exact **post-STF state roots** and then M1:
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
 3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η), the
-   safrole ticket path (§6h, 13/14), **disputes ψ** (§6i, 28/28), and
-   **assurances** (§6j, 10/10). Remaining: `bad_ticket_proof` (ring-proof
-   verify), reports-driven core/service π, accumulation.
+   safrole ticket path (§6h, 13/14), **disputes ψ** (§6i, 28/28),
+   **assurances** (§6j, 10/10), and **reports** (§6k, 42/42). Remaining:
+   `bad_ticket_proof` (ring-proof verify) and accumulation.
 4. **PVM** — register machine + gas metering + host calls.
-5. **accumulate / reports** — depend on the PVM.
-6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅ (§6i), ~~assurances~~ ✅ (§6j).
+5. **accumulate** — depends on the PVM.
+6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅, ~~assurances~~ ✅, ~~reports~~ ✅.
 7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.
 

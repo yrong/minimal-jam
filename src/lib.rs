@@ -34,3 +34,4 @@ pub mod preimages;
 pub mod statistics;
 pub mod disputes;
 pub mod assurances;
+pub mod reports;
