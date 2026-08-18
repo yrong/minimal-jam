@@ -48,3 +48,24 @@ fn safrole_epoch_change_vectors() {
     run("skip-epochs-1"); // skips multiple epochs
     run("skip-epoch-tail-1");
 }
+
+#[test]
+fn safrole_ticket_vectors() {
+    // Ticket submission: id extraction, validity (attempt/order/duplicate/tail),
+    // accumulator merge, winning-tickets marker, and Z(γ_a) sealing on epoch
+    // change. `publish-tickets-no-mark-5` (bad_ticket_proof) is omitted: it needs
+    // ring-proof verification, which is not yet reproduced.
+    run("publish-tickets-no-mark-1"); // bad_ticket_attempt
+    run("publish-tickets-no-mark-2"); // ok: 0 -> 3 accumulated
+    run("publish-tickets-no-mark-3"); // duplicate_ticket
+    run("publish-tickets-no-mark-4"); // bad_ticket_order
+    run("publish-tickets-no-mark-6"); // ok: 3 -> 6 accumulated
+    run("publish-tickets-no-mark-7"); // unexpected_ticket (tail)
+    run("publish-tickets-no-mark-8"); // ok: empty extrinsic in tail
+    run("publish-tickets-no-mark-9"); // ok: epoch change, γ_a reset
+    run("publish-tickets-with-mark-1"); // ok: 7 -> 9
+    run("publish-tickets-with-mark-2"); // ok: 9 -> 12 (saturated)
+    run("publish-tickets-with-mark-3"); // ok: 12 -> 12 (keep lowest E)
+    run("publish-tickets-with-mark-4"); // winning-tickets marker Z(γ_a)
+    run("publish-tickets-with-mark-5"); // epoch change, Z(γ_a) sealing
+}

@@ -11,7 +11,7 @@
 
 use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::blake2b_256;
-use crate::ring::ring_commitment;
+use crate::ring::{ring_commitment, vrf_output_hash};
 use crate::state::{TicketBody, TicketsOrKeys, ValidatorData};
 use crate::types::{
     EpochMark, EpochMarkValidatorKeys, TicketEnvelope, EPOCH_LENGTH, H144, H32, VALIDATORS_COUNT,
@@ -19,6 +19,14 @@ use crate::types::{
 use serde::{Deserialize, Serialize};
 
 const EPOCH: u32 = EPOCH_LENGTH as u32;
+
+/// Slot phase at which the ticket contest closes (`Y`, GP §6). Tickets may only
+/// be submitted while `slot mod E < TAIL_START`; the tail is `[TAIL_START, E)`.
+const TAIL_START: u32 = 10;
+
+/// Ticket entries per validator `N` (GP eq. ticketsextrinsic); the tiny
+/// chain-spec pins `tickets_per_validator = 3`, so the entry index must be < 3.
+const MAX_ATTEMPTS: u8 = 3;
 
 /// Safrole STF state (`stf/safrole` schema).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,18 +78,20 @@ pub enum Outcome {
     Err(SafroleError),
 }
 
-/// Apply the safrole STF. This slice handles the within-epoch, no-ticket case
-/// and epoch transitions with an empty tickets extrinsic. Ticket processing
-/// (ring-proof verification of a non-empty `E_T`) is not yet implemented.
+/// Apply the safrole STF. Covers within-epoch advance, ticket submission and
+/// the epoch transition (fallback or winning-ticket sealing). Ring-proof
+/// verification of each ticket (`bad_ticket_proof`) is not yet reproduced, so
+/// tickets are accepted on their non-crypto validity alone.
 pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
     // Timeslot must be strictly monotonic.
     if input.slot <= pre.tau {
         return (Outcome::Err(SafroleError::BadSlot), pre.clone());
     }
-    assert!(
-        input.extrinsic.is_empty(),
-        "safrole ticket processing not yet implemented"
-    );
+
+    let e_pre = pre.tau / EPOCH;
+    let e_cur = input.slot / EPOCH;
+    let m_pre = pre.tau % EPOCH;
+    let m_cur = input.slot % EPOCH;
 
     // η₀ folds in the per-block entropy every block.
     let new_eta0 = {
@@ -90,15 +100,41 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         Hex(blake2b_256(&buf))
     };
 
-    if input.slot / EPOCH == pre.tau / EPOCH {
-        // Within-epoch advance: only τ and η₀ change.
+    if e_cur == e_pre {
+        // Within-epoch advance. Tickets are only admitted before the tail.
+        if m_cur >= TAIL_START && !input.extrinsic.is_empty() {
+            return (Outcome::Err(SafroleError::UnexpectedTicket), pre.clone());
+        }
+
+        let mut gamma_a = pre.gamma_a.clone();
+        if !input.extrinsic.is_empty() {
+            match validate_tickets(&input.extrinsic, &gamma_a) {
+                Ok(mut news) => {
+                    gamma_a.append(&mut news);
+                    gamma_a.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+                    gamma_a.truncate(EPOCH_LENGTH);
+                }
+                Err(err) => return (Outcome::Err(err), pre.clone()),
+            }
+        }
+
+        // Winning-tickets marker: first block crossing into the tail with a
+        // saturated accumulator publishes Z(γ_a).
+        let tickets_mark = if m_pre < TAIL_START && m_cur >= TAIL_START && gamma_a.len() == EPOCH_LENGTH
+        {
+            Some(z_sequence(&gamma_a))
+        } else {
+            None
+        };
+
         let mut post = pre.clone();
         post.tau = input.slot;
         post.eta.0[0] = new_eta0;
-        return (Outcome::Ok(OutputData { epoch_mark: None, tickets_mark: None }), post);
+        post.gamma_a = gamma_a;
+        return (Outcome::Ok(OutputData { epoch_mark: None, tickets_mark }), post);
     }
 
-    // --- Epoch transition (no tickets → fallback sealing keys) ---
+    // --- Epoch transition ---
 
     // Validator rotation: λ'=κ, κ'=γ_k, γ_k'=Φ(ι) (offender keys nulled).
     let lambda = pre.kappa.clone();
@@ -118,8 +154,13 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         pre.eta.0[2].clone(),
     ]);
 
-    // γ_s' = fallback key sequence F(η₂', κ'); η₂' = prior η₁.
-    let gamma_s = TicketsOrKeys::Keys(fallback_keys(&eta.0[2].0, &kappa.0));
+    // Sealing keys: a single-epoch step whose contest closed with a saturated
+    // accumulator seals with the winning tickets Z(γ_a); otherwise fallback.
+    let gamma_s = if e_cur == e_pre + 1 && m_pre >= TAIL_START && pre.gamma_a.len() == EPOCH_LENGTH {
+        TicketsOrKeys::Tickets(z_sequence(&pre.gamma_a))
+    } else {
+        TicketsOrKeys::Keys(fallback_keys(&eta.0[2].0, &kappa.0))
+    };
 
     // Epoch marker: (η₁', η₂', next-epoch validator keys).
     let epoch_mark = EpochMark {
@@ -150,6 +191,54 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         post_offenders: pre.post_offenders.clone(),
     };
     (Outcome::Ok(OutputData { epoch_mark: Some(epoch_mark), tickets_mark: None }), post)
+}
+
+/// Validate a non-empty tickets extrinsic against the current accumulator and
+/// extract the resulting ticket bodies. The ring-proof itself is not verified.
+fn validate_tickets(
+    extrinsic: &[TicketEnvelope],
+    accumulator: &[TicketBody],
+) -> Result<Vec<TicketBody>, SafroleError> {
+    let mut news = Vec::with_capacity(extrinsic.len());
+    for env in extrinsic {
+        if env.attempt >= MAX_ATTEMPTS {
+            return Err(SafroleError::BadTicketAttempt);
+        }
+        news.push(TicketBody {
+            id: Hex(vrf_output_hash(&env.signature.0)),
+            attempt: env.attempt,
+        });
+    }
+    // Ticket ids must be strictly ascending (sorted and unique within E_T).
+    if news.windows(2).any(|w| w[0].id.0 >= w[1].id.0) {
+        return Err(SafroleError::BadTicketOrder);
+    }
+    // New ids must be disjoint from the accumulator.
+    if news
+        .iter()
+        .any(|t| accumulator.iter().any(|g| g.id.0 == t.id.0))
+    {
+        return Err(SafroleError::DuplicateTicket);
+    }
+    Ok(news)
+}
+
+/// Outside-in reordering `Z` (GP §6): [s₀, sₙ₋₁, s₁, sₙ₋₂, …].
+fn z_sequence(tickets: &[TicketBody]) -> FixedSeq<TicketBody, EPOCH_LENGTH> {
+    let (mut lo, mut hi) = (0, tickets.len());
+    let mut out = Vec::with_capacity(tickets.len());
+    let mut from_front = true;
+    while lo < hi {
+        if from_front {
+            out.push(tickets[lo].clone());
+            lo += 1;
+        } else {
+            hi -= 1;
+            out.push(tickets[hi].clone());
+        }
+        from_front = !from_front;
+    }
+    FixedSeq(out)
 }
 
 /// Fallback key sequence `F(r, k)` (GP eq. fallbackkeysequence): for each epoch

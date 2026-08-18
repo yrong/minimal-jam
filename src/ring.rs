@@ -4,7 +4,7 @@
 //! point. Tiny uses `ring_size = 6`.
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_vrf::suites::bandersnatch::{PcsParams, Public, RingProofParams};
+use ark_vrf::suites::bandersnatch::{Output, PcsParams, Public, RingProofParams};
 use std::sync::LazyLock;
 
 /// KZG SRS (Zcash powers-of-tau, uncompressed) shipped by the test vectors.
@@ -45,4 +45,16 @@ pub fn ring_commitment(keys: &[[u8; 32]]) -> RingCommitmentBytes {
     let mut bytes = [0u8; 144];
     bytes.copy_from_slice(&out);
     bytes
+}
+
+/// Bandersnatch VRF output hash `banderout` — the 32-byte VRF output of a
+/// signature (IETF or ring), taken from the output point in its first 32 bytes.
+pub fn vrf_output_hash(signature: &[u8]) -> [u8; 32] {
+    let out = Output::deserialize_compressed(&signature[..32])
+        .expect("valid bandersnatch VRF output point");
+    let hash = out.hash();
+    let bytes: &[u8] = hash.as_ref();
+    let mut y = [0u8; 32];
+    y.copy_from_slice(&bytes[..32]);
+    y
 }

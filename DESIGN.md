@@ -327,7 +327,7 @@ rotation; β history fills and trims). **Fallback is now fully covered.** Other
 trace sets need transitions not yet wired (reports-driven core/service π,
 disputes ψ, safrole γ, accumulation).
 
-## 6h. Safrole STF (GP §6) — no-ticket path DONE (ring commitment included)
+## 6h. Safrole STF (GP §6) — ticket processing DONE (13/14 vectors)
 
 `src/safrole.rs` implements the isolated safrole STF against the `stf/safrole`
 vectors, for empty-ticket blocks:
@@ -343,15 +343,25 @@ vectors, for empty-ticket blocks:
   - **γ_s' fallback keys** `F(η₂', κ')` (`idx = LE(blake2b(r ‖ E4(i))[..4]) mod V`);
   - η rotation `(η₁',η₂',η₃') = (η₀,η₁,η₂)`, `γ_a' = []`, and the epoch marker
     `(η₀, η₁, γ_k' keys)`.
+- **ticket submission** (`publish-tickets-*`):
+  - id `= banderout(ring_sig[0..32])` (`Output::hash`) — `src/ring.rs`;
+  - non-crypto validity: entry index `< N` (`bad_ticket_attempt`), ids strictly
+    ascending (`bad_ticket_order`), disjoint from `γ_a` (`duplicate_ticket`),
+    none past the tail `slot mod E ≥ Y` (`unexpected_ticket`);
+  - accumulator merge: `γ_a'` keeps the `E` lowest ids;
+  - **winning-tickets marker** `Z(γ_a)` on the first block crossing into the
+    tail with a saturated accumulator, and **`Z(γ_a)` sealing** `γ_s'` on an
+    epoch step whose contest closed full — `Z` is the outside-in reorder.
 
 Each piece was calibrated against a real vector before wiring (γ_z byte-exact,
-F exact). Verified (`tests/safrole.rs`) on all seven no-ticket vectors:
-`enact-epoch-change-with-no-tickets-{1..4}`, `-with-padding-1` (offender
-nullification), `skip-epochs-1`, `skip-epoch-tail-1`.
+F exact, ticket id byte-exact). Verified (`tests/safrole.rs`) on 7 no-ticket
+vectors + 13 `publish-tickets-*` vectors (all attempt/order/duplicate/tail
+errors, accumulation, marker, `Z` sealing, epoch reset).
 
-Deferred: **ticket processing** — ring-proof verification of a non-empty `E_T`
-(the `publish-tickets-*` vectors), the `Z(γ_a)` winning-ticket sealing branch,
-and the winning-tickets marker.
+Deferred: **`bad_ticket_proof`** (`publish-tickets-no-mark-5`) — the only vector
+needing ring-proof *verification*. The id/accumulation all work; the exact
+VRF-input construction for `Public::verify` (beyond `ctx ‖ η₂' ‖ E4(attempt)`)
+is not yet reproduced, so an invalid proof cannot yet be rejected.
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
@@ -361,8 +371,8 @@ To reach byte-exact **post-STF state roots** and then M1:
 2. **State Merkle trie + serialization** (GP Appendix D) — ✅ DONE (§6c–§6f).
    `root(σ) == state_root` on real traces.
 3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η) and the
-   safrole no-ticket path incl. epoch transition + ring commitment (§6h).
-   Remaining: safrole ticket processing (ring-proof verify), reports-driven
+   safrole ticket path incl. epoch transition + ring commitment (§6h, 13/14).
+   Remaining: `bad_ticket_proof` (ring-proof verify), reports-driven
    core/service π, disputes ψ, accumulation.
 4. **PVM** — register machine + gas metering + host calls.
 5. **accumulate / reports** — depend on the PVM.
