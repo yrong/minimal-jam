@@ -27,37 +27,41 @@ fn run(name: &str) -> Result<(), String> {
         return Err("output".into());
     }
     if post != c.post_state {
-        return Err("post_state".into());
+        let gp = serde_json::to_value(&post).unwrap();
+        let wp = serde_json::to_value(&c.post_state).unwrap();
+        let field = ["accounts", "statistics", "ready_queue", "accumulated", "slot", "privileges", "entropy"]
+            .iter()
+            .find(|k| gp[*k] != wp[*k])
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "other".into());
+        return Err(format!("post_state.{field}"));
     }
     Ok(())
 }
 
-/// Queue-management vectors: reports are enqueued (unsatisfied deps) or the
-/// block accumulates nothing, so no PVM execution is required.
-const QUEUE_ONLY: &[&str] = &[
-    "no_available_reports-1",
-    "enqueue_and_unlock_simple-1",
-    "enqueue_and_unlock_with_sr_lookup-1",
-    "enqueue_and_unlock_chain-1",
-    "enqueue_and_unlock_chain-2",
-    "enqueue_and_unlock_chain_wraps-1",
-    "enqueue_and_unlock_chain_wraps-3",
-    "enqueue_self_referential-1",
-    "enqueue_self_referential-2",
-    "enqueue_self_referential-3",
-    "enqueue_self_referential-4",
-    "queues_are_shifted-2",
-    "ready_queue_editing-1",
-    "work_for_ejected_service-1",
-];
-
 #[test]
-fn accumulate_queue_vectors() {
+fn accumulate_vectors() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/accumulate");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            (p.extension()? == "json").then(|| p.file_stem()?.to_str().map(String::from))?
+        })
+        .collect();
+    names.sort();
     let mut failures = Vec::new();
-    for name in QUEUE_ONLY {
+    for name in &names {
         if let Err(why) = run(name) {
             failures.push(format!("{name}: {why}"));
         }
     }
-    assert!(failures.is_empty(), "{} failed:\n{}", failures.len(), failures.join("\n"));
+    eprintln!("accumulate: {}/{} pass", names.len() - failures.len(), names.len());
+    assert!(
+        failures.is_empty(),
+        "{}/{} failed:\n{}",
+        failures.len(),
+        names.len(),
+        failures.join("\n")
+    );
 }

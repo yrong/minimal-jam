@@ -10,12 +10,14 @@
 //! output root — is not yet implemented; vectors that actually accumulate a
 //! report (immediate or dependency-resolved) are therefore not yet handled.
 
+use crate::accumulate_exec::{accounts_map, run_service, Operand};
 use crate::bytes::{Blob, FixedSeq, Hex};
 use crate::state::{
-    AccumulatedQueue, ReadyQueue, ReadyRecord, ServiceInfo, ServiceStatEntry,
+    AccumulatedQueue, ReadyQueue, ReadyRecord, ServiceActivityRecord, ServiceInfo, ServiceStatEntry,
 };
-use crate::types::{WorkReport, CORE_COUNT, EPOCH_LENGTH, H32};
+use crate::types::{WorkExecResult, WorkReport, CORE_COUNT, EPOCH_LENGTH, H32};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const EPOCH: usize = EPOCH_LENGTH;
 
@@ -180,27 +182,112 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
     let mut accumulatable = immediate.clone();
     accumulatable.extend(priority(&q_input));
 
-    // Execution is not yet implemented: bail (post == pre) so accumulating
-    // vectors fail loudly rather than producing a wrong state.
-    if !accumulatable.is_empty() {
-        return (Outcome::Ok(Hex([0u8; 32])), pre.clone());
+    // --- Gas-bounded accumulation execution ---
+    // Tiny block accumulation gas: max(block_gas_limit, report_acc_gas·cores).
+    const BLOCK_ACC_GAS: i64 = 20_000_000;
+    let mut acc_reports: Vec<WorkReport> = Vec::new();
+    let mut gas_total = 0i64;
+    for r in &accumulatable {
+        let rg: i64 = r.results.iter().map(|d| d.accumulate_gas as i64).sum();
+        if gas_total + rg > BLOCK_ACC_GAS {
+            break;
+        }
+        gas_total += rg;
+        acc_reports.push(r.clone());
     }
 
-    // --- n = 0: pure queue integration ---
+    let mut accounts = accounts_map(&pre.accounts);
+    let mut services: Vec<u32> = Vec::new();
+    for r in &acc_reports {
+        for d in &r.results {
+            if !services.contains(&d.service_id) {
+                services.push(d.service_id);
+            }
+        }
+    }
+    let mut stat_map: BTreeMap<u32, (u32, u64)> = BTreeMap::new();
+    let mut yields: Vec<(u32, [u8; 32])> = Vec::new();
+    let mut deferred: Vec<crate::accumulate_exec::Transfer> = Vec::new();
+    for &s in &services {
+        let mut operands = Vec::new();
+        let mut gas_s = 0i64;
+        for r in &acc_reports {
+            for d in &r.results {
+                if d.service_id != s {
+                    continue;
+                }
+                gas_s += d.accumulate_gas as i64;
+                operands.push(Operand {
+                    package_hash: r.package_spec.hash.0,
+                    seg_root: r.package_spec.exports_root.0,
+                    authorizer: r.authorizer_hash.0,
+                    payload_hash: d.payload_hash.0,
+                    gas_limit: d.accumulate_gas,
+                    auth_trace: r.auth_output.0.clone(),
+                    result: work_result(&d.result),
+                });
+            }
+        }
+        let count = operands.len() as u32;
+        let code = accounts
+            .get(&s)
+            .and_then(|a| {
+                let ch = a.service.code_hash.0;
+                a.preimage_blobs.iter().find(|p| p.hash.0 == ch).map(|p| p.blob.0.clone())
+            })
+            .unwrap_or_default();
+        let out = run_service(&code, input.slot, s, gas_s, &operands, accounts);
+        accounts = out.accounts;
+        stat_map.insert(s, (count, out.gas_used as u64));
+        if let Some(h) = out.yielded {
+            yields.push((s, h));
+        }
+        deferred.extend(out.transfers);
+    }
+    // Apply deferred transfers: credit the destination if it still exists,
+    // otherwise the funds are burnt (e.g. the destination was ejected).
+    for t in &deferred {
+        if let Some(a) = accounts.get_mut(&t.dest) {
+            a.service.balance += t.amount;
+        }
+    }
+    // Update the last-accumulation slot for every accumulated service.
+    for &s in &services {
+        if let Some(a) = accounts.get_mut(&s) {
+            a.service.last_accumulation_slot = input.slot;
+        }
+    }
+    let n = acc_reports.len();
+
     let mut post = pre.clone();
     post.slot = input.slot;
-    // π_S holds only this block's accumulation stats; nothing accumulated → empty.
-    post.statistics = Vec::new();
+    post.accounts = accounts
+        .into_iter()
+        .map(|(id, data)| AccountsMapEntry { id, data })
+        .collect();
+    post.statistics = stat_map
+        .into_iter()
+        .map(|(id, (count, gas))| ServiceStatEntry {
+            id,
+            record: ServiceActivityRecord {
+                accumulate_count: count,
+                accumulate_gas_used: gas,
+                ..zero_service_record()
+            },
+        })
+        .collect();
 
     // Shift the accumulated ring buffer; the newest slot holds this block's
-    // accumulated package hashes (none here).
+    // accumulated package hashes.
     let mut accd = pre.accumulated.0.clone();
     for i in 0..EPOCH - 1 {
         accd[i] = pre.accumulated.0[i + 1].clone();
     }
-    accd[EPOCH - 1] = Vec::new();
+    let mut newest: Vec<H32> = acc_reports.iter().map(|r| r.package_spec.hash.clone()).collect();
+    newest.sort_by(|a, b| a.0.cmp(&b.0));
+    accd[EPOCH - 1] = newest.clone();
     post.accumulated = FixedSeq(accd);
-    let newest: Vec<[u8; 32]> = post.accumulated.0[EPOCH - 1].iter().map(|h| h.0).collect();
+    let newest_raw: Vec<[u8; 32]> = newest.iter().map(|h| h.0).collect();
 
     // Rebuild the ready ring buffer (GP eq. finalstateaccumulation).
     let gap = (input.slot - pre.slot) as usize;
@@ -208,17 +295,94 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
     for i in 0..EPOCH {
         let idx = (m + EPOCH - i) % EPOCH;
         ready[idx] = if i == 0 {
-            edit(&queued, &newest).iter().map(pending_to_record).collect()
+            edit(&queued, &newest_raw).iter().map(pending_to_record).collect()
         } else if i < gap {
             Vec::new()
         } else {
             let old: Vec<Pending> = pre.ready_queue.0[idx].iter().map(record_to_pending).collect();
-            edit(&old, &newest).iter().map(pending_to_record).collect()
+            edit(&old, &newest_raw).iter().map(pending_to_record).collect()
         };
     }
     post.ready_queue = FixedSeq(ready);
 
-    (Outcome::Ok(Hex([0u8; 32])), post)
+    let root = if yields.is_empty() {
+        [0u8; 32]
+    } else {
+        accumulation_root(&yields)
+    };
+    let _ = n;
+    (Outcome::Ok(Hex(root)), post)
+}
+
+/// Map a work-execution result to the operand result (`Ok` blob or error code).
+fn work_result(r: &WorkExecResult) -> Result<Vec<u8>, u8> {
+    match r {
+        WorkExecResult::Ok(b) => Ok(b.0.clone()),
+        WorkExecResult::OutOfGas(_) => Err(1),
+        WorkExecResult::Panic(_) => Err(2),
+        WorkExecResult::BadExports(_) => Err(3),
+        WorkExecResult::OutputOversize(_) => Err(4),
+        WorkExecResult::BadCode(_) => Err(5),
+        WorkExecResult::CodeOversize(_) => Err(6),
+    }
+}
+
+/// A zeroed service-activity record.
+fn zero_service_record() -> ServiceActivityRecord {
+    ServiceActivityRecord {
+        provided_count: 0,
+        provided_size: 0,
+        refinement_count: 0,
+        refinement_gas_used: 0,
+        imports: 0,
+        extrinsic_count: 0,
+        extrinsic_size: 0,
+        exports: 0,
+        accumulate_count: 0,
+        accumulate_gas_used: 0,
+    }
+}
+
+/// Accumulation-output root: the keccak well-balanced binary Merkle root
+/// (GP `M_B`) of the service-indexed yields, leaves `E4(s) ‖ h`, sorted by
+/// service. Empty yields give the zero hash.
+fn accumulation_root(yields: &[(u32, [u8; 32])]) -> [u8; 32] {
+    let mut pairs = yields.to_vec();
+    pairs.sort_by_key(|(s, _)| *s);
+    let leaves: Vec<Vec<u8>> = pairs
+        .iter()
+        .map(|(s, h)| {
+            let mut leaf = s.to_le_bytes().to_vec();
+            leaf.extend_from_slice(h);
+            leaf
+        })
+        .collect();
+    match leaves.len() {
+        0 => [0u8; 32],
+        1 => crate::crypto::keccak_256(&leaves[0]),
+        _ => {
+            let node = merkle_node(&leaves);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&node);
+            h
+        }
+    }
+}
+
+/// GP Merkle node function `N` (keccak, `$node` prefix). A single node returns
+/// its blob verbatim (possibly wider than 32 octets); combined nodes hash to 32.
+fn merkle_node(v: &[Vec<u8>]) -> Vec<u8> {
+    match v.len() {
+        0 => vec![0u8; 32],
+        1 => v[0].clone(),
+        _ => {
+            let mid = v.len().div_ceil(2);
+            let mut buf = b"$node".to_vec();
+            buf.extend_from_slice(&merkle_node(&v[..mid]));
+            buf.extend_from_slice(&merkle_node(&v[mid..]));
+            crate::crypto::keccak_256(&buf).to_vec()
+        }
+    }
 }
 
 fn record_to_pending(r: &ReadyRecord) -> Pending {

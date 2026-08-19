@@ -465,9 +465,12 @@ registers, paged 2³²-byte memory, per-basic-block gas charging.
 `sbrk` occupies 101, shifting count/clz/ctz/sign-extend/reverse to 102–111.
 
 
-## 6m. Accumulate STF (GP §12) — queue management (14/30 vectors)
+## 6m. Accumulate STF (GP §12) — queue management + execution — DONE (30/30 vectors)
 
-`src/accumulate.rs` implements the **history + queuing** half of accumulation:
+`src/accumulate.rs` + `src/accumulate_exec.rs` implement both halves of
+accumulation:
+
+**Queue management** (`accumulate.rs`):
 - newly-available reports partitioned into **immediate** (no prerequisites and
   empty segment-root lookup) and **deferred** (dependency-bearing);
 - the queue-editing `E` (drop accumulated reports + resolved deps), the priority
@@ -475,18 +478,35 @@ registers, paged 2³²-byte memory, per-basic-block gas charging.
 - the **ready ring buffer** `ϑ` and **accumulated ring buffer** `ξ` are shifted
   per GP eq. finalstateaccumulation (new entries at `slot mod E`, gap slots
   cleared, oldest dropped);
-- `π_S` holds only this block's accumulation stats (empty when nothing runs);
-- output = the accumulation-output keccak root (zero for an empty block).
+- output = the **keccak well-balanced Merkle root** (`M_B`, GP §Merklization) of
+  the service-indexed yields (leaves `E4(s) ‖ h`, sorted); zero for no yields.
 
-Passes the 14 vectors where **no report is accumulated** (all deps unsatisfied,
-or no reports): `no_available_reports`, `enqueue_and_unlock_*`,
-`enqueue_self_referential-*`, `queues_are_shifted-2`, `ready_queue_editing-1`,
-`work_for_ejected_service-1`.
+**Execution** (`accumulate_exec.rs`): each accumulatable report's digests are
+grouped by service and the service's `accumulate` entry (pc 5) is invoked in the
+PVM (`Vm`, the resumable variant) via standard-program init `Y` (RO/heap/stack/
+args zones, `sbrk`-growable heap). The host-call ABI uses jam-pvm ecalli
+numbering (`0` gas, `1` fetch, `3` read, `4` write, `5` info, `20` transfer,
+`21` eject, `25` yield, `100` log). Service-account mutations (storage writes
+with octet/item accounting), yields, ejections, and deferred transfers are
+threaded back into `π_S` and δ.
 
-**Deferred (execution half):** invoking each service's `accumulate` logic in the
-PVM with the host-call ABI (storage/info/transfer/new/upgrade/…), deferred
-transfers, and the resulting service-account mutations + non-zero output root.
-The remaining 16 vectors accumulate ≥1 report and need this.
+**Deferred transfers + ejection:** `transfer` deducts the caller's balance and
+records a `(dest, amount)` deferred transfer; after every service accumulates,
+each is credited to its destination, or **burnt** if the destination no longer
+exists (e.g. it was `eject`ed the same block — `eject` removes the target and
+credits its full balance to the caller). A ready-but-absent service (a queued
+report whose dependency resolves this block, but whose account was never
+created) still accumulates with 0 gas, producing its `π_S` entry.
+
+**Gas model (tiny test service):** block gas = instruction count per basic
+block (incl. `ecalli`); host calls cost a flat 10, except `log` 0, `yield` 30,
+`eject` 40, and `transfer` = 50 + its reserved gas limit (GP `g = CgasT + l`);
+each `Ψ_H` invocation carries a fixed +10 setup premium (protocol-params fetch +
+allocator init). Calibrated byte-exact against the vectors' `accumulate_gas_used`.
+
+Passes all 30 vectors: queue-only, every ≥1-report accumulation (immediate,
+ready-queue cascade, multi-operand, self-referential chains), account ejection,
+and deferred transfers to ejected destinations.
 
 ## 7. What is intentionally NOT here, and the dependency order to add it
 
@@ -498,10 +518,10 @@ To reach byte-exact **post-STF state roots** and then M1:
 3. **Block-import STFs** — ✅ fallback fully covered (§6g: τ, π, α, β, η), the
    safrole ticket path (§6h, 13/14), **disputes ψ** (§6i, 28/28),
    **assurances** (§6j, 10/10), and **reports** (§6k, 42/42). Remaining:
-   `bad_ticket_proof` (ring-proof verify) and accumulation.
+   `bad_ticket_proof` (ring-proof verify).
 4. **PVM** — ✅ DONE (§6l, 311/311). 64-bit interpreter, gas, page faults.
-5. **accumulate** — 🚧 queue management done (§6m, 14/30); execution half
-   (PVM host-call ABI + deferred transfers) remains.
+5. **accumulate** — ✅ DONE (§6m, 30/30). Queue management + PVM execution +
+   deferred transfers + ejection.
 6. **safrole** (bandersnatch RingVRF), ~~disputes~~ ✅, ~~assurances~~ ✅, ~~reports~~ ✅.
 7. **fuzzer target** — TCP server speaking `fuzz-proto`, which is how
    `jam-conformance` actually drives an implementation.

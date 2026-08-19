@@ -158,9 +158,13 @@ fn execute(
             // r_D = low nibble, r_A = high nibble.
             let d = (zeta(code, i + 1) % 16).min(12) as usize;
             let a = reg(regs, (zeta(code, i + 1) / 16).min(12) as usize);
+            if op == 101 {
+                // sbrk: grow the heap by `a` bytes, return the previous break.
+                regs[d] = memory.sbrk(a as u32) as u64;
+                return Action::Next;
+            }
             regs[d] = match op {
                 100 => a,                              // move_reg
-                101 => a,                              // sbrk (untested placeholder)
                 102 => a.count_ones() as u64,          // count_set_bits_64
                 103 => (a as u32).count_ones() as u64, // count_set_bits_32
                 104 => a.leading_zeros() as u64,       // leading_zero_bits_64

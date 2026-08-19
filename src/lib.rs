@@ -37,3 +37,4 @@ pub mod assurances;
 pub mod reports;
 pub mod pvm;
 pub mod accumulate;
+pub mod accumulate_exec;

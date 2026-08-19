@@ -40,6 +40,10 @@ pub struct MemoryChunk {
 #[derive(Clone, Debug, Default)]
 pub struct Memory {
     pages: BTreeMap<u32, Page>,
+    /// Current program break (heap top) for `sbrk`; 0 when unused.
+    pub heap_top: u32,
+    /// Upper bound the heap may `sbrk` to (reserved heap-zone end).
+    pub heap_max: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +58,88 @@ impl Memory {
             data: vec![0u8; PAGE_SIZE as usize],
             writable,
         });
+    }
+
+    /// Map an accessible region (rounding to whole pages), for the page map and
+    /// standard-program initialization.
+    pub fn map(&mut self, address: u32, length: u32, writable: bool) {
+        let first = address / PAGE_SIZE as u32;
+        let last = (address as u64 + length as u64).div_ceil(PAGE_SIZE) as u32;
+        for p in first..last {
+            self.ensure(p, writable);
+        }
+    }
+
+    /// Grow the heap by `size` bytes (polkavm `sbrk`). Returns the previous
+    /// program break (the start of the newly mapped region), or the current
+    /// break when `size == 0` (query). Returns 0 if the growth would exceed
+    /// `heap_max`.
+    pub fn sbrk(&mut self, size: u32) -> u32 {
+        if size == 0 {
+            return self.heap_top;
+        }
+        let old = self.heap_top;
+        let new = match old.checked_add(size) {
+            Some(n) if n <= self.heap_max => n,
+            _ => return 0,
+        };
+        self.map(old, size, true);
+        self.heap_top = new;
+        old
+    }
+
+    /// Write bytes into already-mapped pages (initial memory / SPI data).
+    pub fn store(&mut self, address: u32, bytes: &[u8]) {
+        for (k, &b) in bytes.iter().enumerate() {
+            let x = address as u64 + k as u64;
+            if let Some(p) = self.pages.get_mut(&((x / PAGE_SIZE) as u32)) {
+                p.data[(x % PAGE_SIZE) as usize] = b;
+            }
+        }
+    }
+
+    /// Read `len` bytes from `address` (zero for unmapped bytes). Caller must
+    /// have validated the range with [`readable_range`]; capped defensively.
+    pub fn load(&self, address: u32, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|k| {
+                let x = address as u64 + k as u64;
+                self.pages
+                    .get(&((x / PAGE_SIZE) as u32))
+                    .map_or(0, |p| p.data[(x % PAGE_SIZE) as usize])
+            })
+            .collect()
+    }
+
+    /// Whether `[address, address+len)` is entirely readable. Page-based and
+    /// capped so an absurd `len` returns `false` immediately (no huge loop).
+    pub fn readable_range(&self, address: u32, len: u64) -> bool {
+        self.range_ok(address, len, false)
+    }
+
+    /// Whether `[address, address+len)` is entirely writable (capped).
+    pub fn writable_range(&self, address: u32, len: u64) -> bool {
+        self.range_ok(address, len, true)
+    }
+
+    fn range_ok(&self, address: u32, len: u64, write: bool) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let first = address as u64 / PAGE_SIZE;
+        let last = (address as u64 + len - 1) / PAGE_SIZE;
+        // A range spanning more pages than exist can't be fully mapped.
+        if last - first + 1 > self.pages.len() as u64 {
+            return false;
+        }
+        (first..=last).all(|p| {
+            let addr = p * PAGE_SIZE;
+            if write {
+                self.writable(addr)
+            } else {
+                self.readable(addr)
+            }
+        })
     }
 
     fn readable(&self, addr: u64) -> bool {
@@ -89,6 +175,11 @@ impl Memory {
             }
             Some(m) => Err(ExitStatus::PageFault((m / PAGE_SIZE * PAGE_SIZE) as u32)),
         }
+    }
+
+    /// Whether page `page` is mapped and writable.
+    pub fn page_writable(&self, page: u32) -> bool {
+        self.pages.get(&page).is_some_and(|p| p.writable)
     }
 
     fn read(&self, addr: u64, len: usize) -> u64 {
@@ -274,7 +365,74 @@ fn zeta(code: &[u8], i: usize) -> u8 {
     code.get(i).copied().unwrap_or(0)
 }
 
-/// Execute a program blob to a halting condition.
+/// A resumable PVM instance: run to an exit, handle a host call externally,
+/// then resume. Used by the accumulate invocation (`Ψ_H`).
+pub struct Vm {
+    program: Program,
+    pub pc: u32,
+    pub gas: i64,
+    pub regs: [u64; REG_COUNT],
+    pub memory: Memory,
+    gas_charged: bool,
+}
+
+impl Vm {
+    /// Build a VM over a program blob with pre-initialized memory.
+    pub fn new(program: &[u8], pc: u32, gas: i64, regs: [u64; REG_COUNT], memory: Memory) -> Option<Self> {
+        Some(Vm {
+            program: deblob(program)?,
+            pc,
+            gas,
+            regs,
+            memory,
+            gas_charged: false,
+        })
+    }
+
+    /// Execute until a halting condition. On a host call the pc is left at the
+    /// `ecalli`; call `advance_host` after handling it, then resume.
+    pub fn run(&mut self) -> ExitStatus {
+        loop {
+            let i = self.pc as usize;
+            if !self.gas_charged {
+                let cost = block_gas_cost(&self.program, block_start_of(&self.program, i));
+                if self.gas < cost {
+                    return ExitStatus::OutOfGas;
+                }
+                self.gas -= cost;
+                self.gas_charged = true;
+            }
+            let op = zeta(&self.program.code, i);
+            let ell = skip(&self.program.bitmask, i);
+            let next = (i + 1 + ell) as u32;
+            match execute(&self.program, op, i, ell, &mut self.regs, &mut self.memory) {
+                Action::Next => {
+                    self.pc = next;
+                    if is_terminator(op) {
+                        self.gas_charged = false;
+                    }
+                }
+                Action::Jump(target) => {
+                    self.pc = target;
+                    self.gas_charged = false;
+                }
+                Action::Halt => return ExitStatus::Halt,
+                Action::Panic => return ExitStatus::Panic,
+                Action::PageFault(a) => return ExitStatus::PageFault(a),
+                Action::HostCall(id) => return ExitStatus::HostCall(id),
+            }
+        }
+    }
+
+    /// Advance the pc past the current `ecalli` (same basic block, gas already
+    /// charged) so execution can resume after a handled host call.
+    pub fn advance_host(&mut self) {
+        let i = self.pc as usize;
+        self.pc = (i + 1 + skip(&self.program.bitmask, i)) as u32;
+    }
+}
+
+/// Execute a program blob to a halting condition (one-shot, no host calls).
 pub fn run(
     program: &[u8],
     pc: u32,
@@ -285,80 +443,16 @@ pub fn run(
 ) -> Outcome {
     let mut memory = Memory::default();
     for e in page_map {
-        let first = e.address / PAGE_SIZE as u32;
-        let last = (e.address as u64 + e.length as u64).div_ceil(PAGE_SIZE) as u32;
-        for p in first..last {
-            memory.ensure(p, e.writable);
-        }
+        memory.map(e.address, e.length, e.writable);
     }
     for c in memory_init {
-        for (k, &b) in c.contents.iter().enumerate() {
-            let x = c.address as u64 + k as u64;
-            let page = (x / PAGE_SIZE) as u32;
-            if let Some(p) = memory.pages.get_mut(&page) {
-                p.data[(x % PAGE_SIZE) as usize] = b;
-            }
-        }
+        memory.store(c.address, &c.contents);
     }
-
-    let Some(prog) = deblob(program) else {
-        return Outcome { status: ExitStatus::Panic, pc, gas, regs, memory };
+    let Some(mut vm) = Vm::new(program, pc, gas, regs, memory) else {
+        return Outcome { status: ExitStatus::Panic, pc, gas, regs, memory: Memory::default() };
     };
-
-    interpret(&prog, pc, gas, regs, memory)
-}
-
-fn interpret(
-    prog: &Program,
-    mut pc: u32,
-    mut gas: i64,
-    mut regs: [u64; REG_COUNT],
-    mut memory: Memory,
-) -> Outcome {
-    let mut gas_charged = false;
-    loop {
-        let i = pc as usize;
-
-        // Charge the whole basic block's gas on entry.
-        if !gas_charged {
-            let cost = block_gas_cost(prog, block_start_of(prog, i));
-            if gas < cost {
-                return Outcome { status: ExitStatus::OutOfGas, pc, gas, regs, memory };
-            }
-            gas -= cost;
-            gas_charged = true;
-        }
-        let op = zeta(&prog.code, i);
-        let ell = skip(&prog.bitmask, i);
-        let next = (i + 1 + ell) as u32;
-
-        let action = execute(prog, op, i, ell, &mut regs, &mut memory);
-
-        match action {
-            Action::Next => {
-                pc = next;
-                if is_terminator(op) {
-                    gas_charged = false;
-                }
-            }
-            Action::Jump(target) => {
-                pc = target;
-                gas_charged = false;
-            }
-            Action::Halt => {
-                return Outcome { status: ExitStatus::Halt, pc, gas, regs, memory };
-            }
-            Action::Panic => {
-                return Outcome { status: ExitStatus::Panic, pc, gas, regs, memory };
-            }
-            Action::PageFault(a) => {
-                return Outcome { status: ExitStatus::PageFault(a), pc, gas, regs, memory };
-            }
-            Action::HostCall(id) => {
-                return Outcome { status: ExitStatus::HostCall(id), pc, gas, regs, memory };
-            }
-        }
-    }
+    let status = vm.run();
+    Outcome { status, pc: vm.pc, gas: vm.gas, regs: vm.regs, memory: vm.memory }
 }
 
 enum Action {
