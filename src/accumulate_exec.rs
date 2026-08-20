@@ -155,9 +155,10 @@ fn compact(n: u64) -> Vec<u8> {
     out
 }
 
-/// Preimage-request expunge period `C_expungeperiod` (GP): a forgotten request
-/// may be fully dropped only once its unavailability is this old.
-const EXPUNGE: u32 = 14_400 + 4_800;
+/// Preimage-request expunge period `C_expungeperiod`: a forgotten request may
+/// be fully dropped only once its unavailability is this old. Tiny value (also
+/// the `min_turnaround_period` field of the protocol parameters).
+const EXPUNGE: u32 = 32;
 
 /// Decode a preimage-request status: a length byte (0–3) then that many 4-byte
 /// little-endian timeslots.
