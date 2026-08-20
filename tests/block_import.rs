@@ -89,30 +89,39 @@ fn check_file(path: &Path) {
     // Unified entry point: import_block must reproduce the entire posterior σ —
     // every chapter (changed and carried-through) and the merklized root.
     let post_sigma = import_block(&sigma, &t.block);
-    assert_eq!(post_sigma.serialize(), post, "{ctx}: T(σ') dictionary mismatch");
+    let got = post_sigma.serialize();
+    if got != post {
+        let mut diff: Vec<u8> = Vec::new();
+        for k in got.keys().chain(post.keys()) {
+            if got.get(k) != post.get(k) && !diff.contains(&k[0]) {
+                diff.push(k[0]);
+            }
+        }
+        panic!("{ctx}: T(σ') dictionary mismatch; differing chapters (first key byte): {diff:?}");
+    }
     let root = format!("0x{}", hex::encode(post_sigma.root()));
     assert_eq!(root, t.post_state.state_root.to_lowercase(), "{ctx}: σ' root mismatch");
 }
 
-/// Collect fallback trace files under `dir` (a directory that contains or is a
-/// `fallback` set).
-fn fallback_files(dir: &Path) -> Vec<PathBuf> {
+/// Collect trace files under `dir` belonging to the named `category`
+/// (e.g. `"fallback"`, `"safrole"`), excluding `genesis.json`.
+fn trace_files(dir: &Path, category: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, category: &str, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else { return };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
-                walk(&p, out);
+                walk(&p, category, out);
             } else if p.extension().map(|x| x == "json").unwrap_or(false)
                 && p.file_stem().map(|s| s != "genesis").unwrap_or(false)
-                && p.components().any(|c| c.as_os_str() == "fallback")
+                && p.components().any(|c| c.as_os_str() == category)
             {
                 out.push(p);
             }
         }
     }
-    walk(dir, &mut out);
+    walk(dir, category, &mut out);
     out.sort();
     out
 }
@@ -120,23 +129,28 @@ fn fallback_files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn vendored_fallback_import() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/traces");
-    let files = fallback_files(&dir);
+    let files = trace_files(&dir, "fallback");
     assert!(!files.is_empty(), "no vendored fallback traces");
     for f in files {
         check_file(&f);
     }
 }
 
+/// Exhaustive block-import over a full local `traces/` checkout (`JAM_TRACES_DIR`);
+/// skipped when unset. Covers both the `fallback` and `safrole` categories.
 #[test]
-fn external_fallback_import() {
+fn external_traces_import() {
     let Ok(dir) = std::env::var("JAM_TRACES_DIR") else {
         eprintln!("JAM_TRACES_DIR unset; skipping exhaustive block-import check");
         return;
     };
-    let files = fallback_files(Path::new(&dir));
-    assert!(!files.is_empty(), "no fallback traces under JAM_TRACES_DIR");
-    for f in &files {
-        check_file(f);
+    let dir = Path::new(&dir);
+    for category in ["fallback", "safrole"] {
+        let files = trace_files(dir, category);
+        assert!(!files.is_empty(), "no {category} traces under JAM_TRACES_DIR");
+        for f in &files {
+            check_file(f);
+        }
+        eprintln!("block-import verified for {} {category} traces", files.len());
     }
-    eprintln!("block-import verified for {} fallback traces", files.len());
 }

@@ -21,19 +21,19 @@
 //! verified byte-exact (`T(σ')` dictionary + state root) against the whole
 //! `traces/fallback` set (100 blocks, spanning epoch boundaries).
 //!
-//! Not yet wired (later slices): the safrole **ring-VRF ticket path** (winning
-//! tickets, `bad_ticket_proof`), work-report-driven core/service statistics,
-//! guarantees ρ, assurances, disputes ψ, and accumulation (the non-trivial β
-//! accumulation-output root). These fire on non-`fallback` traces.
+//! Not yet wired (later slices): rejecting invalid ticket ring-proofs
+//! (`bad_ticket_proof`), and the work-report-driven subsystems — core/service
+//! statistics, guarantees ρ, assurances, disputes ψ, and accumulation (the
+//! non-trivial β accumulation-output root). These fire on richer traces.
 
 use crate::authorizations::MAX_POOL;
 use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::{blake2b_256, mmr_append, mmr_super_peak};
 use crate::history::MAX_HISTORY;
-use crate::safrole::fallback_keys;
+use crate::safrole::{transition as safrole_step, Input as SafroleStfIn, State as SafroleStf};
 use crate::state::{
     AuthPools, AuthQueues, BlockInfo, EntropyBuffer, Mmr, RecentBlocks, ReportedWorkPackage,
-    State, Statistics, TicketsOrKeys, TimeSlot, ValidatorActivityRecord,
+    SafroleState, State, Statistics, TimeSlot, ValidatorActivityRecord,
 };
 use crate::types::{Block, EPOCH_LENGTH};
 use ark_serialize::CanonicalDeserialize;
@@ -208,35 +208,59 @@ pub fn next_entropy(pre: &EntropyBuffer, prior_slot: TimeSlot, block: &Block) ->
     FixedSeq(out)
 }
 
-/// Unified block-import entry point: apply the implemented block-level state
-/// transitions to `pre` under `block`, returning the posterior σ.
+/// Unified block-import entry point: apply the block-level state transitions to
+/// `pre` under `block`, returning the posterior σ.
 ///
-/// **Scope (this slice):** the crypto-light block chapters that fully determine
-/// no-work, no-epoch-boundary blocks — τ (C11), π (C13), α (C1), β (C3) with an
-/// empty accumulation-output root, and η (C6). All other chapters (γ safrole,
-/// ψ disputes, validator sets, ρ, accumulation queues, service accounts) are
-/// carried through unchanged. This reproduces the `fallback` traces byte-exact;
-/// epoch-boundary validator/safrole rotation and work-report-driven subsystems
-/// (guarantees ρ, assurances, accumulate) are later increments.
+/// The safrole-owned chapters — τ (C11), η (C6), the validator sets ι/κ/λ
+/// (C7/8/9), and γ (C4: pending, ring commitment, sealing keys, ticket
+/// accumulator) — are delegated to the tested [`crate::safrole::transition`],
+/// which covers within-epoch advance, ticket accumulation, and the epoch
+/// transition (fallback keys or winning tickets, γ_z ring commitment). The
+/// remaining crypto-light chapters are computed here: π (C13), α (C1), and
+/// β (C3, with an empty accumulation-output root).
+///
+/// **Scope:** reproduces the `fallback` and `safrole` traces byte-exact.
+/// Work-report-driven subsystems (guarantees ρ, assurances, disputes ψ,
+/// accumulation → non-trivial β root) are later increments.
 pub fn import_block(pre: &State, block: &Block) -> State {
     let prior_slot = pre.timeslot;
     let mut post = pre.clone();
-    post.timeslot = next_timeslot(block);
+
+    // π (C13), α (C1), β (C3) — computed against the prior state.
     post.statistics = next_statistics(&pre.statistics, prior_slot, block);
     post.auth_pools = next_auth_pools(&pre.auth_pools, &pre.auth_queues, block);
-    // No work reports in scope → the accumulation-output root is the empty hash.
     post.recent_blocks = next_recent_blocks(&pre.recent_blocks, block, [0u8; 32]);
-    post.entropy = next_entropy(&pre.entropy, prior_slot, block);
 
-    // γ (C4) safrole: on an epoch boundary with no winning tickets (fallback),
-    // reseed the epoch's sealing keys from η₂' and reset the ticket accumulator.
-    // Validators are steady in fallback, so γ_p / γ_z are carried through (no
-    // ring-VRF recompute).
-    let epoch_len = EPOCH_LENGTH as u32;
-    if block.header.slot / epoch_len > prior_slot / epoch_len {
-        post.safrole.tickets_or_keys =
-            TicketsOrKeys::Keys(fallback_keys(&post.entropy.0[2].0, &post.active_validators.0));
-        post.safrole.accumulator = Vec::new();
-    }
+    // τ/η/ι/κ/λ/γ — delegate to the safrole STF. The per-block entropy is the
+    // Bandersnatch VRF output of the seal's entropy source.
+    let sf_pre = SafroleStf {
+        tau: pre.timeslot,
+        eta: pre.entropy.clone(),
+        lambda: pre.previous_validators.clone(),
+        kappa: pre.active_validators.clone(),
+        gamma_k: pre.safrole.pending.clone(),
+        iota: pre.staging_validators.clone(),
+        gamma_a: pre.safrole.accumulator.clone(),
+        gamma_s: pre.safrole.tickets_or_keys.clone(),
+        gamma_z: pre.safrole.ring_commitment.clone(),
+        post_offenders: pre.disputes.offenders.clone(),
+    };
+    let sf_in = SafroleStfIn {
+        slot: block.header.slot,
+        entropy: Hex(bander_output(&block.header.entropy_source.0)),
+        extrinsic: block.extrinsic.tickets.clone(),
+    };
+    let (_out, sf) = safrole_step(&sf_pre, &sf_in);
+    post.timeslot = sf.tau;
+    post.entropy = sf.eta;
+    post.previous_validators = sf.lambda;
+    post.active_validators = sf.kappa;
+    post.staging_validators = sf.iota;
+    post.safrole = SafroleState {
+        pending: sf.gamma_k,
+        ring_commitment: sf.gamma_z,
+        tickets_or_keys: sf.gamma_s,
+        accumulator: sf.gamma_a,
+    };
     post
 }

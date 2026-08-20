@@ -162,6 +162,24 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         TicketsOrKeys::Keys(fallback_keys(&eta.0[2].0, &kappa.0))
     };
 
+    // The new epoch's accumulator starts empty, then admits this block's tickets
+    // (submitted only before the tail). GP: γ_a resets on the epoch turn, and
+    // the boundary block may itself begin the next contest.
+    let mut gamma_a: Vec<TicketBody> = Vec::new();
+    if !input.extrinsic.is_empty() {
+        if m_cur >= TAIL_START {
+            return (Outcome::Err(SafroleError::UnexpectedTicket), pre.clone());
+        }
+        match validate_tickets(&input.extrinsic, &gamma_a) {
+            Ok(mut news) => {
+                gamma_a.append(&mut news);
+                gamma_a.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+                gamma_a.truncate(EPOCH_LENGTH);
+            }
+            Err(err) => return (Outcome::Err(err), pre.clone()),
+        }
+    }
+
     // Epoch marker: (η₁', η₂', next-epoch validator keys).
     let epoch_mark = EpochMark {
         entropy: pre.eta.0[0].clone(),
@@ -185,7 +203,7 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         kappa,
         gamma_k,
         iota,
-        gamma_a: Vec::new(),
+        gamma_a,
         gamma_s,
         gamma_z,
         post_offenders: pre.post_offenders.clone(),
