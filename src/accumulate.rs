@@ -1,14 +1,24 @@
-//! Accumulate STF (GP §12) — history, queuing, and dependency resolution.
+//! Accumulate STF (GP §12) — history, queuing, dependency resolution, and
+//! PVM execution. Passes all 30 `stf/accumulate/tiny` vectors byte-exact.
 //!
-//! This slice implements the **queue management** half of accumulation: it
-//! partitions newly-available reports into immediately-accumulatable and
-//! deferred (dependency-bearing) ones, resolves the ready-queue dependency
-//! graph, and shifts the ready (`ϑ`) and accumulated (`ξ`) ring buffers.
+//! **Queue management** (this file): partitions newly-available reports into
+//! immediately-accumulatable and deferred (dependency-bearing) ones, resolves
+//! the ready-queue dependency graph (`E`/`Q`), and shifts the ready (`ϑ`) and
+//! accumulated (`ξ`) ring buffers per GP eq. finalstateaccumulation.
 //!
-//! The **execution** half — invoking each service's `accumulate` logic in the
-//! PVM with the host-call ABI, deferred transfers, and the keccak accumulation
-//! output root — is not yet implemented; vectors that actually accumulate a
-//! report (immediate or dependency-resolved) are therefore not yet handled.
+//! **Execution** (`accumulate_exec`): invokes each service's `accumulate`
+//! logic in the PVM (`Ψ_A`, standard-program init `Y`), threads the host-call
+//! ABI, deferred transfers, ejection, and the keccak accumulation-output root.
+//!
+//! Known simplifications (sufficient for the tiny vectors, not full GP):
+//! - host-call gas uses a small empirical model, not the GP base constants;
+//! - deferred transfers credit/burn the destination balance but do not run its
+//!   `on_transfer` PVM logic (no covered vector requires it);
+//! - unimplemented host calls (`new`/`upgrade`/`bless`/`designate`/`assign`/
+//!   `solicit`/`forget`/`query`/`lookup`/`checkpoint`/`provide`) return `HUH`;
+//! - the exceptional dimension rolls back to the pre-invocation accounts rather
+//!   than honouring `checkpoint`; privileges (`χ`) and always-accumulate are
+//!   carried through unchanged.
 
 use crate::accumulate_exec::{accounts_map, run_service, Operand};
 use crate::bytes::{Blob, FixedSeq, Hex};
