@@ -59,6 +59,12 @@ pub fn service_hash(s: u32, h: &[u8]) -> StateKey {
     k
 }
 
+/// Extract the service id from a `C(s, h)` service-dictionary state-key
+/// (service bytes live at positions 0, 2, 4, 6).
+pub fn key_service(k: &StateKey) -> u32 {
+    u32::from_le_bytes([k[0], k[2], k[4], k[6]])
+}
+
 /// Account metadata key `C(255, s)`.
 pub fn service_account(s: u32) -> StateKey {
     chapter_service(255, s)

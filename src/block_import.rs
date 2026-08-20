@@ -27,21 +27,30 @@
 //! non-trivial β accumulation-output root). These fire on richer traces.
 
 use crate::authorizations::MAX_POOL;
+use crate::accumulate::accumulate_core;
+use crate::accumulate_exec::ExecState;
 use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::{blake2b_256, mmr_append, mmr_super_peak};
 use crate::history::MAX_HISTORY;
 use crate::safrole::{transition as safrole_step, Input as SafroleStfIn, State as SafroleStf};
-use crate::assurances::{transition as assurances_step, Input as AssurancesIn, State as AssurancesStf};
+use crate::assurances::{
+    transition as assurances_step, Input as AssurancesIn, Outcome as AssurancesOutcome,
+    State as AssurancesStf,
+};
 use crate::disputes::{transition as disputes_step, Input as DisputesIn, State as DisputesStf};
 use crate::reports::{
     transition as reports_step, Account as RepAccount, AccountsMapEntry as RepAccountEntry,
     Input as ReportsIn, State as ReportsStf,
 };
 use crate::state::{
-    AuthPools, AuthQueues, BlockInfo, EntropyBuffer, Mmr, RecentBlocks, ReportedWorkPackage,
-    SafroleState, ServiceInfo, State, Statistics, TimeSlot, ValidatorActivityRecord,
+    AuthPools, AuthQueues, BlockInfo, CoreActivityRecord, EntropyBuffer, Mmr, RecentBlocks,
+    ReportedWorkPackage,
+    SafroleState, ServiceActivityRecord, ServiceInfo, ServiceStatEntry, State, Statistics,
+    TimeSlot, ValidatorActivityRecord,
 };
-use crate::types::{Block, EPOCH_LENGTH, H32};
+use crate::state_key::{service_preimage, service_request, StateKey};
+use crate::types::{Block, CORE_COUNT, EPOCH_LENGTH, H32};
+use std::collections::BTreeMap;
 use ark_serialize::CanonicalDeserialize;
 use ark_vrf::suites::bandersnatch::Output as VrfOutput;
 use jam_codec::Encode;
@@ -89,10 +98,20 @@ pub fn next_statistics(pre: &Statistics, prior_slot: TimeSlot, block: &Block) ->
         .map(|p| p.blob.0.len() as u32)
         .sum::<u32>();
 
-    for g in &block.extrinsic.guarantees {
-        for cred in &g.signatures {
-            curr[cred.validator_index as usize].guarantees += 1;
-        }
+    // A validator's guarantee count is credited once per block for the reports
+    // it helped guarantee, not per signature: the guarantors form a set (GP's
+    // deduplicated `reporters`), so a validator signing several guarantees in
+    // one block still counts once.
+    let mut guarantors: Vec<u16> = block
+        .extrinsic
+        .guarantees
+        .iter()
+        .flat_map(|g| g.signatures.iter().map(|c| c.validator_index))
+        .collect();
+    guarantors.sort_unstable();
+    guarantors.dedup();
+    for v in guarantors {
+        curr[v as usize].guarantees += 1;
     }
     for a in &block.extrinsic.assurances {
         curr[a.validator_index as usize].assurances += 1;
@@ -154,7 +173,9 @@ pub fn next_recent_blocks(pre: &RecentBlocks, block: &Block, accumulate_root: [u
     mmr_append(&mut peaks, accumulate_root);
     let beefy_root = mmr_super_peak(&peaks);
 
-    let reported = block
+    // Reported work-packages are stored sorted by package hash, matching the
+    // reports STF's `reported` output.
+    let mut reported: Vec<ReportedWorkPackage> = block
         .extrinsic
         .guarantees
         .iter()
@@ -163,6 +184,7 @@ pub fn next_recent_blocks(pre: &RecentBlocks, block: &Block, accumulate_root: [u
             exports_root: g.report.package_spec.exports_root.clone(),
         })
         .collect();
+    reported.sort_by(|a, b| a.hash.0.cmp(&b.hash.0));
 
     history.push(BlockInfo {
         header_hash: Hex(blake2b_256(&block.header.encode())),
@@ -232,10 +254,10 @@ pub fn import_block(pre: &State, block: &Block) -> State {
     let prior_slot = pre.timeslot;
     let mut post = pre.clone();
 
-    // π (C13), α (C1), β (C3) — computed against the prior state.
+    // π (C13 validators) and α (C1) — computed against the prior state. β (C3)
+    // is deferred until after accumulate, whose output root feeds its MMR.
     post.statistics = next_statistics(&pre.statistics, prior_slot, block);
     post.auth_pools = next_auth_pools(&pre.auth_pools, &pre.auth_queues, block);
-    post.recent_blocks = next_recent_blocks(&pre.recent_blocks, block, [0u8; 32]);
 
     // τ/η/ι/κ/λ/γ — delegate to the safrole STF. The per-block entropy is the
     // Bandersnatch VRF output of the seal's entropy source.
@@ -287,7 +309,7 @@ pub fn import_block(pre: &State, block: &Block) -> State {
     post.disputes = disp.psi;
     let rho_dagger = disp.rho;
 
-    let (_aout, asr) = assurances_step(
+    let (aout, asr) = assurances_step(
         &AssurancesStf {
             avail_assignments: rho_dagger,
             curr_validators: post.active_validators.clone(),
@@ -318,8 +340,10 @@ pub fn import_block(pre: &State, block: &Block) -> State {
             recent_blocks: beta_dagger,
             auth_pools: pre.auth_pools.clone(),
             accounts: avail_accounts(&pre.accounts),
-            cores_statistics: post.statistics.cores.clone(),
-            services_statistics: post.statistics.services.clone(),
+            // Core/service statistics (π_C, π_S) are per-block: reports starts
+            // from a zeroed baseline, not the carried-through prior values.
+            cores_statistics: zero_cores(),
+            services_statistics: Vec::new(),
         },
         &ReportsIn {
             guarantees: block.extrinsic.guarantees.clone(),
@@ -330,7 +354,130 @@ pub fn import_block(pre: &State, block: &Block) -> State {
     post.avail = rep.avail_assignments;
     post.statistics.cores = rep.cores_statistics;
     post.statistics.services = rep.services_statistics;
+
+    // --- Accumulate (GP §12) ------------------------------------------------
+    // Reports made available this block (assurances output) are the accumulate
+    // input; the shared core evolves service accounts (δ, C255 + service dict),
+    // the ready/accumulated ring buffers (ϑ C14, ξ C15), and yields the
+    // accumulation-output root that seeds β's MMR (C3).
+    let available: Vec<crate::types::WorkReport> = match aout {
+        AssurancesOutcome::Ok(o) => o.reported,
+        AssurancesOutcome::Err(_) => Vec::new(),
+    };
+
+    // Availability-driven core statistics (π_C): every assurance credits its
+    // cores' assurer count (popularity); each report made available this block
+    // adds its work-bundle length to that core's data-availability load.
+    for a in &block.extrinsic.assurances {
+        for c in 0..CORE_COUNT {
+            if a.bitfield.0[c / 8] & (1 << (c % 8)) != 0 {
+                post.statistics.cores.0[c].popularity += 1;
+            }
+        }
+    }
+    for r in &available {
+        post.statistics.cores.0[r.core_index as usize].da_load += r.package_spec.length;
+    }
+    let exec = ExecState {
+        accounts: pre.accounts.iter().cloned().collect(),
+        dict: pre.service_dict.iter().cloned().collect::<BTreeMap<StateKey, Vec<u8>>>(),
+        key_raw: BTreeMap::new(),
+    };
+    let core = accumulate_core(
+        block.header.slot,
+        pre.timeslot,
+        &pre.ready,
+        &pre.accumulated,
+        &available,
+        exec,
+    );
+    let ExecState { accounts: acc_out, dict: mut service_dict, .. } = core.exec;
+    post.accounts = acc_out.into_iter().collect();
+    post.ready = core.ready;
+    post.accumulated = core.accumulated;
+    merge_accumulate_stats(&mut post.statistics.services, &core.stat_map);
+
+    // Preimage provision (GP §12): store each provided blob under its preimage
+    // state-key, stamp the matching request with this slot, and advance the
+    // provider's provided_* statistics. The footprint (a_i/a_o) counts requests
+    // fixed at solicit time, so provision leaves account metadata unchanged.
+    for p in &block.extrinsic.preimages {
+        let s = p.requester;
+        let blob = p.blob.0.clone();
+        let len = blob.len() as u32;
+        let hash = blake2b_256(&blob);
+        service_dict.insert(service_preimage(s, &hash), blob);
+        let mut status = vec![1u8]; // sequence length 1
+        status.extend_from_slice(&block.header.slot.to_le_bytes());
+        service_dict.insert(service_request(s, len, &hash), status);
+        let rec = service_stat_mut(&mut post.statistics.services, s);
+        rec.provided_count += 1;
+        rec.provided_size += len;
+    }
+    post.statistics.services.sort_by_key(|e| e.id);
+    post.service_dict = service_dict.into_iter().collect();
+
+    // β (C3): now that the accumulation-output root is known, fold it into the
+    // recent-blocks MMR.
+    post.recent_blocks = next_recent_blocks(&pre.recent_blocks, block, core.root);
     post
+}
+
+/// A per-block-zeroed core-statistics vector (π_C baseline).
+fn zero_cores() -> FixedSeq<CoreActivityRecord, CORE_COUNT> {
+    let z = CoreActivityRecord {
+        da_load: 0,
+        popularity: 0,
+        imports: 0,
+        extrinsic_count: 0,
+        extrinsic_size: 0,
+        exports: 0,
+        bundle_size: 0,
+        gas_used: 0,
+    };
+    FixedSeq(vec![z; CORE_COUNT])
+}
+
+/// A zeroed service-activity record (π_S baseline).
+fn zero_service_activity() -> ServiceActivityRecord {
+    ServiceActivityRecord {
+        provided_count: 0,
+        provided_size: 0,
+        refinement_count: 0,
+        refinement_gas_used: 0,
+        imports: 0,
+        extrinsic_count: 0,
+        extrinsic_size: 0,
+        exports: 0,
+        accumulate_count: 0,
+        accumulate_gas_used: 0,
+    }
+}
+
+/// Get (or create, zeroed) the π_S record for service `id`.
+fn service_stat_mut(services: &mut Vec<ServiceStatEntry>, id: u32) -> &mut ServiceActivityRecord {
+    match services.iter().position(|e| e.id == id) {
+        Some(pos) => &mut services[pos].record,
+        None => {
+            services.push(ServiceStatEntry { id, record: zero_service_activity() });
+            &mut services.last_mut().unwrap().record
+        }
+    }
+}
+
+/// Fold accumulate per-service activity (count, gas) into the service
+/// statistics π_S already carrying refinement counts, creating entries for
+/// services that accumulated without being refined this block.
+fn merge_accumulate_stats(
+    services: &mut Vec<ServiceStatEntry>,
+    stat_map: &BTreeMap<u32, (u32, u64)>,
+) {
+    for (id, (count, gas)) in stat_map {
+        let rec = service_stat_mut(services, *id);
+        rec.accumulate_count = *count;
+        rec.accumulate_gas_used = *gas;
+    }
+    services.sort_by_key(|e| e.id);
 }
 
 /// Project the unified service accounts into the reports STF's metadata-only

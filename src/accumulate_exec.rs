@@ -3,7 +3,8 @@
 //! Runs a service's `accumulate` logic in the PVM with the accumulate host-call
 //! subset, then reports the mutated accounts, gas used, and yielded output.
 
-use crate::accumulate::{AccountsMapEntry, ServiceAccount, StorageMapEntry};
+use crate::state::ServiceInfo;
+use crate::state_key::{key_service, service_preimage, service_request, service_storage, StateKey};
 use crate::bytes::Hex;
 use crate::crypto::blake2b_256;
 use crate::pvm::{ExitStatus, Memory, Vm};
@@ -28,9 +29,20 @@ pub struct Transfer {
     pub amount: u64,
 }
 
+/// Service state visible to accumulate: per-service metadata plus the opaque
+/// state-key dictionary (storage/preimages/requests). `key_raw` records the raw
+/// storage key behind each hashed storage state-key so the typed accumulate STF
+/// post-state can be reconstructed; it is irrelevant to the trace path.
+#[derive(Clone, Default)]
+pub struct ExecState {
+    pub accounts: BTreeMap<u32, ServiceInfo>,
+    pub dict: BTreeMap<StateKey, Vec<u8>>,
+    pub key_raw: BTreeMap<StateKey, (u32, Vec<u8>)>,
+}
+
 /// Result of running one service's accumulate logic.
 pub struct AccOut {
-    pub accounts: BTreeMap<u32, ServiceAccount>,
+    pub state: ExecState,
     pub gas_used: i64,
     pub yielded: Option<[u8; 32]>,
     pub transfers: Vec<Transfer>,
@@ -143,6 +155,31 @@ fn compact(n: u64) -> Vec<u8> {
     out
 }
 
+/// Preimage-request expunge period `C_expungeperiod` (GP): a forgotten request
+/// may be fully dropped only once its unavailability is this old.
+const EXPUNGE: u32 = 14_400 + 4_800;
+
+/// Decode a preimage-request status: a length byte (0–3) then that many 4-byte
+/// little-endian timeslots.
+fn decode_status(bytes: &[u8]) -> Vec<u32> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let n = bytes[0] as usize;
+    (0..n)
+        .map(|i| u32::from_le_bytes([bytes[1 + i * 4], bytes[2 + i * 4], bytes[3 + i * 4], bytes[4 + i * 4]]))
+        .collect()
+}
+
+/// Encode a preimage-request status (inverse of [`decode_status`]).
+fn encode_status(slots: &[u32]) -> Vec<u8> {
+    let mut v = compact(slots.len() as u64);
+    for s in slots {
+        v.extend_from_slice(&s.to_le_bytes());
+    }
+    v
+}
+
 /// Encode one operand as `AccumulateItem::WorkItem(WorkItemRecord)` (jam-types
 /// SCALE layout) for the `fetch` host call.
 fn encode_operand(op: &Operand) -> Vec<u8> {
@@ -231,21 +268,17 @@ pub fn run_service(
     service: u32,
     gas: i64,
     operands: &[Operand],
-    accounts: BTreeMap<u32, ServiceAccount>,
+    state: ExecState,
 ) -> AccOut {
     let args = acc_args(slot, service, operands.len() as u32);
     let Some((pvm, regs, memory, _a, _b)) = spi(code, &args) else {
-        return AccOut { accounts, gas_used: 0, yielded: None, transfers: Vec::new() };
+        return AccOut { state, gas_used: 0, yielded: None, transfers: Vec::new() };
     };
     let Some(mut vm) = Vm::new(&pvm, 5, gas, regs, memory) else {
-        return AccOut { accounts, gas_used: 0, yielded: None, transfers: Vec::new() };
+        return AccOut { state, gas_used: 0, yielded: None, transfers: Vec::new() };
     };
-    // Invocation setup premium (tiny test model): fixed host/allocator setup gas
-    // charged once per `Ψ_H` invocation, beyond the flat per-call costs.
-    vm.gas -= 10;
-
-    let orig = accounts.clone();
-    let mut ctx = accounts;
+    let orig = state.clone();
+    let mut ctx = state;
     let mut yielded: Option<[u8; 32]> = None;
     let mut transfers: Vec<Transfer> = Vec::new();
     let encoded_operands: Vec<Vec<u8>> = operands.iter().map(encode_operand).collect();
@@ -253,18 +286,18 @@ pub fn run_service(
     loop {
         match vm.run() {
             ExitStatus::HostCall(n) => {
-                host(n, &mut vm, service, &mut ctx, &encoded_operands, &mut yielded, &mut transfers);
+                host(n, &mut vm, service, slot, &mut ctx, &encoded_operands, &mut yielded, &mut transfers);
                 vm.advance_host();
             }
             ExitStatus::Halt => break,
             _ => {
                 // Panic/out-of-gas/fault: the exceptional dimension discards the
                 // regular-context changes (no checkpoint in the covered vectors).
-                return AccOut { accounts: orig, gas_used: gas - vm.gas, yielded: None, transfers: Vec::new() };
+                return AccOut { state: orig, gas_used: gas - vm.gas, yielded: None, transfers: Vec::new() };
             }
         }
     }
-    AccOut { accounts: ctx, gas_used: gas - vm.gas, yielded, transfers }
+    AccOut { state: ctx, gas_used: gas - vm.gas, yielded, transfers }
 }
 
 /// Dispatch a host call, mutating VM state and the accumulate context.
@@ -272,24 +305,16 @@ fn host(
     n: u64,
     vm: &mut Vm,
     service: u32,
-    accounts: &mut BTreeMap<u32, ServiceAccount>,
+    slot: u32,
+    state: &mut ExecState,
     operands: &[Vec<u8>],
     yielded: &mut Option<[u8; 32]>,
     transfers: &mut Vec<Transfer>,
 ) {
-    // Host-call gas (tiny test model): most calls cost 10; `log` (JIP-1 debug)
-    // is free; `yield` 30, `eject` 40. A memo `transfer` reserves its gas limit
-    // for the destination's deferred `on_transfer` (GP `g = CgasT + l`), here a
-    // 50 base plus the limit in r9. The `ecalli` instruction itself is charged
-    // with its basic block; each invocation carries a one-time setup premium.
-    let cost = match n {
-        100 => 0,                        // log
-        25 => 30,                        // yield
-        21 => 40,                        // eject
-        20 => 50 + vm.regs[9] as i64,    // transfer: base + reserved gas limit
-        _ => 10,
-    };
-    vm.gas -= cost;
+    // Host-call gas (tiny test model): a flat 10 per host call, except a memo
+    // `transfer`, which additionally reserves its destination's `on_transfer`
+    // gas limit (r9). The `ecalli` instruction itself is charged with its block.
+    vm.gas -= if n == 20 { 10 + vm.regs[9] as i64 } else { 10 };
     let reg = vm.regs;
     match n {
         0 => {
@@ -320,9 +345,7 @@ fn host(
                 return;
             }
             let key = vm.memory.load(reg[8] as u32, reg[9] as usize);
-            let val = accounts
-                .get(&who)
-                .and_then(|a| a.storage.iter().find(|e| e.key.0 == key).map(|e| e.value.0.clone()));
+            let val = state.dict.get(&service_storage(who, &key)).cloned();
             match val {
                 Some(v) => {
                     let f = (reg[11] as usize).min(v.len());
@@ -343,38 +366,40 @@ fn host(
             }
             let key = vm.memory.load(reg[7] as u32, reg[8] as usize);
             let value = vm.memory.load(reg[9] as u32, reg[10] as usize);
-            let Some(acct) = accounts.get_mut(&service) else {
+            if !state.accounts.contains_key(&service) {
                 vm.regs[7] = WHO;
                 return;
-            };
-            let pos = acct.storage.iter().position(|e| e.key.0 == key);
-            let old_len = pos.map(|p| acct.storage[p].value.0.len());
-            if reg[10] == 0 {
-                if let Some(p) = pos {
-                    let removed = acct.storage.remove(p);
-                    acct.service.items -= 1;
-                    acct.service.bytes -=
-                        ITEM_OVERHEAD + removed.key.0.len() as u64 + removed.value.0.len() as u64;
-                }
-            } else if let Some(p) = pos {
-                acct.service.bytes =
-                    acct.service.bytes - acct.storage[p].value.0.len() as u64 + value.len() as u64;
-                acct.storage[p].value = crate::bytes::Blob(value);
-            } else {
-                acct.service.items += 1;
-                acct.service.bytes += ITEM_OVERHEAD + key.len() as u64 + value.len() as u64;
-                acct.storage.push(StorageMapEntry {
-                    key: crate::bytes::Blob(key),
-                    value: crate::bytes::Blob(value),
-                });
-                acct.storage.sort_by(|a, b| a.key.0.cmp(&b.key.0));
             }
-            vm.regs[7] = old_len.map_or(NONE, |l| l as u64);
+            let sk = service_storage(service, &key);
+            let old = state.dict.get(&sk).map(|v| v.len());
+            if reg[10] == 0 {
+                if let Some(old_len) = old {
+                    state.dict.remove(&sk);
+                    state.key_raw.remove(&sk);
+                    if let Some(a) = state.accounts.get_mut(&service) {
+                        a.items -= 1;
+                        a.bytes -= ITEM_OVERHEAD + key.len() as u64 + old_len as u64;
+                    }
+                }
+            } else {
+                if let Some(a) = state.accounts.get_mut(&service) {
+                    match old {
+                        Some(old_len) => a.bytes = a.bytes - old_len as u64 + value.len() as u64,
+                        None => {
+                            a.items += 1;
+                            a.bytes += ITEM_OVERHEAD + key.len() as u64 + value.len() as u64;
+                        }
+                    }
+                }
+                state.dict.insert(sk, value);
+                state.key_raw.insert(sk, (service, key));
+            }
+            vm.regs[7] = old.map_or(NONE, |l| l as u64);
         }
         5 => {
             // info(service=r7, ptr=r8, offset=r9, len=r10)
             let who = if reg[7] == NONE { service } else { reg[7] as u32 };
-            let data = accounts.get(&who).map(|a| encode_info(&a.service));
+            let data = state.accounts.get(&who).map(encode_info);
             let (o, f0, z) = (reg[8], reg[9], reg[10]);
             match data {
                 None => vm.regs[7] = NONE,
@@ -398,15 +423,17 @@ fn host(
             // eject(target=r7): remove the target service, crediting its full
             // balance to the caller (GP Ω_J, tiny 0.7.2 model).
             let d = reg[7] as u32;
-            if !accounts.contains_key(&d) {
+            if !state.accounts.contains_key(&d) {
                 vm.regs[7] = WHO;
             } else if d == service {
                 vm.regs[7] = HUH;
             } else {
-                let bal = accounts[&d].service.balance;
-                accounts.remove(&d);
-                if let Some(me) = accounts.get_mut(&service) {
-                    me.service.balance += bal;
+                let bal = state.accounts[&d].balance;
+                state.accounts.remove(&d);
+                state.dict.retain(|k, _| key_service(k) != d);
+                state.key_raw.retain(|k, _| key_service(k) != d);
+                if let Some(me) = state.accounts.get_mut(&service) {
+                    me.balance += bal;
                 }
                 vm.regs[7] = 0;
             }
@@ -417,19 +444,141 @@ fn host(
             // to the destination after all services accumulate (GP Ω_T).
             let dest = reg[7] as u32;
             let amount = reg[8];
-            if !accounts.contains_key(&dest) {
+            if !state.accounts.contains_key(&dest) {
                 vm.regs[7] = WHO;
-            } else if accounts.get(&service).is_none_or(|a| a.service.balance < amount) {
+            } else if state.accounts.get(&service).is_none_or(|a| a.balance < amount) {
                 vm.regs[7] = CASH;
             } else {
-                if let Some(me) = accounts.get_mut(&service) {
-                    me.service.balance -= amount;
+                if let Some(me) = state.accounts.get_mut(&service) {
+                    me.balance -= amount;
                 }
                 transfers.push(Transfer { dest, amount });
                 vm.regs[7] = 0;
             }
         }
         100 => { /* log: no-op */ }
+        2 => {
+            // lookup(service=r7, hash_ptr=r8, out=r9, offset=r10, out_len=r11):
+            // read a preimage blob by hash from `service`'s dictionary.
+            let who = if reg[7] == NONE { service } else { reg[7] as u32 };
+            if !vm.memory.readable_range(reg[8] as u32, 32) {
+                vm.regs[7] = NONE;
+                return;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
+            match state.dict.get(&service_preimage(who, &h)).cloned() {
+                Some(v) => {
+                    let f = (reg[10] as usize).min(v.len());
+                    let l = (reg[11] as usize).min(v.len() - f);
+                    vm.memory.store(reg[9] as u32, &v[f..f + l]);
+                    vm.regs[7] = v.len() as u64;
+                }
+                None => vm.regs[7] = NONE,
+            }
+        }
+        22 => {
+            // query(target=r7, hash_ptr=r8, length=r9): report a preimage
+            // request's status in r7 (count + first-slot<<32) and r8 (rest).
+            let s = if reg[7] == NONE { service } else { reg[7] as u32 };
+            let z = reg[9] as u32;
+            if !vm.memory.readable_range(reg[8] as u32, 32) {
+                vm.regs[7] = NONE;
+                return;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
+            if !state.accounts.contains_key(&s) {
+                vm.regs[7] = WHO;
+                return;
+            }
+            match state.dict.get(&service_request(s, z, &h)).map(|b| decode_status(b)) {
+                None => {
+                    vm.regs[7] = NONE;
+                    vm.regs[8] = 0;
+                }
+                Some(a) => {
+                    let sl = |i: usize| a.get(i).copied().unwrap_or(0) as u64;
+                    vm.regs[7] = a.len() as u64 + (sl(0) << 32);
+                    vm.regs[8] = sl(1) + (sl(2) << 32);
+                }
+            }
+        }
+        23 => {
+            // solicit(target=r7, hash_ptr=r8, length=r9): request a preimage.
+            let d = if reg[7] == NONE { service } else { reg[7] as u32 };
+            let z = reg[9] as u32;
+            if !vm.memory.readable_range(reg[8] as u32, 32) {
+                vm.regs[7] = NONE;
+                return;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
+            if !state.accounts.contains_key(&d) {
+                vm.regs[7] = WHO;
+                return;
+            }
+            let rk = service_request(d, z, &h);
+            match state.dict.get(&rk).map(|b| decode_status(b)) {
+                None => {
+                    state.dict.insert(rk, encode_status(&[]));
+                    if let Some(a) = state.accounts.get_mut(&d) {
+                        a.items += 2;
+                        a.bytes += 81 + z as u64;
+                    }
+                    vm.regs[7] = 0;
+                }
+                Some(s) if s.len() == 2 => {
+                    let ns = [s[0], s[1], slot];
+                    state.dict.insert(rk, encode_status(&ns));
+                    vm.regs[7] = 0;
+                }
+                _ => vm.regs[7] = HUH,
+            }
+        }
+        24 => {
+            // forget(target=r7, hash_ptr=r8, length=r9): drop a preimage request.
+            let d = if reg[7] == NONE { service } else { reg[7] as u32 };
+            let z = reg[9] as u32;
+            if !vm.memory.readable_range(reg[8] as u32, 32) {
+                vm.regs[7] = NONE;
+                return;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
+            if !state.accounts.contains_key(&d) {
+                vm.regs[7] = WHO;
+                return;
+            }
+            let rk = service_request(d, z, &h);
+            let drop_request = |state: &mut ExecState| {
+                state.dict.remove(&rk);
+                if let Some(a) = state.accounts.get_mut(&d) {
+                    a.items -= 2;
+                    a.bytes -= 81 + z as u64;
+                }
+            };
+            match state.dict.get(&rk).map(|b| decode_status(b)) {
+                Some(s) if s.is_empty() => {
+                    drop_request(state);
+                    vm.regs[7] = 0;
+                }
+                Some(s) if s.len() == 2 && s[1] < slot.saturating_sub(EXPUNGE) => {
+                    drop_request(state);
+                    state.dict.remove(&service_preimage(d, &h));
+                    vm.regs[7] = 0;
+                }
+                Some(s) if s.len() == 1 => {
+                    state.dict.insert(rk, encode_status(&[s[0], slot]));
+                    vm.regs[7] = 0;
+                }
+                Some(s) if s.len() == 3 && s[1] < slot.saturating_sub(EXPUNGE) => {
+                    state.dict.insert(rk, encode_status(&[s[2], slot]));
+                    vm.regs[7] = 0;
+                }
+                _ => vm.regs[7] = HUH,
+            }
+        }
         _ => {
             vm.regs[7] = HUH;
         }
@@ -460,11 +609,6 @@ fn encode_info(s: &crate::state::ServiceInfo) -> Vec<u8> {
     v.extend_from_slice(&s.bytes.to_le_bytes());
     v.extend_from_slice(&(s.items).to_le_bytes());
     v
-}
-
-// Helper so the accumulate STF can build the accounts map from vector entries.
-pub fn accounts_map(entries: &[AccountsMapEntry]) -> BTreeMap<u32, ServiceAccount> {
-    entries.iter().map(|e| (e.id, e.data.clone())).collect()
 }
 
 /// A provided preimage hash helper (blake2b) — used by preimage integration.

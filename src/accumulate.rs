@@ -20,7 +20,8 @@
 //!   than honouring `checkpoint`; privileges (`χ`) and always-accumulate are
 //!   carried through unchanged.
 
-use crate::accumulate_exec::{accounts_map, run_service, Operand};
+use crate::accumulate_exec::{run_service, ExecState, Operand};
+use crate::state_key::{service_preimage, service_storage};
 use crate::bytes::{Blob, FixedSeq, Hex};
 use crate::state::{
     AccumulatedQueue, ReadyQueue, ReadyRecord, ServiceActivityRecord, ServiceInfo, ServiceStatEntry,
@@ -161,20 +162,37 @@ fn priority(records: &[Pending]) -> Vec<WorkReport> {
     out
 }
 
-/// Apply the accumulate STF.
-pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
-    let m = input.slot as usize % EPOCH;
-    let accumulated_cup: Vec<[u8; 32]> = pre.accumulated.0.iter().flatten().map(|h| h.0).collect();
+/// Shared, account-representation-agnostic accumulate core: queue management
+/// (`W*`), gas-bounded PVM execution over the ready services, deferred
+/// transfers, and the ready/accumulated ring-buffer rebuild. Both the typed STF
+/// [`transition`] and the unified block-import path drive this on an
+/// [`ExecState`].
+pub struct AccCore {
+    pub exec: ExecState,
+    pub stat_map: BTreeMap<u32, (u32, u64)>,
+    pub ready: ReadyQueue,
+    pub accumulated: AccumulatedQueue,
+    pub root: [u8; 32],
+}
+
+pub fn accumulate_core(
+    slot: u32,
+    pre_slot: u32,
+    ready_queue: &ReadyQueue,
+    accumulated_q: &AccumulatedQueue,
+    reports: &[WorkReport],
+    mut exec: ExecState,
+) -> AccCore {
+    let m = slot as usize % EPOCH;
+    let accumulated_cup: Vec<[u8; 32]> = accumulated_q.0.iter().flatten().map(|h| h.0).collect();
 
     // Partition newly-available reports.
-    let immediate: Vec<WorkReport> = input
-        .reports
+    let immediate: Vec<WorkReport> = reports
         .iter()
         .filter(|r| r.context.prerequisites.is_empty() && r.segment_root_lookup.is_empty())
         .cloned()
         .collect();
-    let queued_raw: Vec<Pending> = input
-        .reports
+    let queued_raw: Vec<Pending> = reports
         .iter()
         .filter(|r| !r.context.prerequisites.is_empty() || !r.segment_root_lookup.is_empty())
         .map(|r| (r.clone(), dependencies(r)))
@@ -185,7 +203,7 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
     let immediate_hashes: Vec<[u8; 32]> = immediate.iter().map(package_hash).collect();
     let mut q_input: Vec<Pending> = Vec::new();
     for i in 0..EPOCH {
-        q_input.extend(pre.ready_queue.0[(m + i) % EPOCH].iter().map(record_to_pending));
+        q_input.extend(ready_queue.0[(m + i) % EPOCH].iter().map(record_to_pending));
     }
     q_input.extend(queued.iter().cloned());
     let q_input = edit(&q_input, &immediate_hashes);
@@ -193,7 +211,6 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
     accumulatable.extend(priority(&q_input));
 
     // --- Gas-bounded accumulation execution ---
-    // Tiny block accumulation gas: max(block_gas_limit, report_acc_gas·cores).
     const BLOCK_ACC_GAS: i64 = 20_000_000;
     let mut acc_reports: Vec<WorkReport> = Vec::new();
     let mut gas_total = 0i64;
@@ -206,7 +223,6 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         acc_reports.push(r.clone());
     }
 
-    let mut accounts = accounts_map(&pre.accounts);
     let mut services: Vec<u32> = Vec::new();
     for r in &acc_reports {
         for d in &r.results {
@@ -239,15 +255,15 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
             }
         }
         let count = operands.len() as u32;
-        let code = accounts
+        // Resolve the service code from its preimage in the state-key dict.
+        let code = exec
+            .accounts
             .get(&s)
-            .and_then(|a| {
-                let ch = a.service.code_hash.0;
-                a.preimage_blobs.iter().find(|p| p.hash.0 == ch).map(|p| p.blob.0.clone())
-            })
+            .map(|a| a.code_hash.0)
+            .and_then(|ch| exec.dict.get(&service_preimage(s, &ch)).cloned())
             .unwrap_or_default();
-        let out = run_service(&code, input.slot, s, gas_s, &operands, accounts);
-        accounts = out.accounts;
+        let out = run_service(&code, slot, s, gas_s, &operands, exec);
+        exec = out.state;
         stat_map.insert(s, (count, out.gas_used as u64));
         if let Some(h) = out.yielded {
             yields.push((s, h));
@@ -257,25 +273,73 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
     // Apply deferred transfers: credit the destination if it still exists,
     // otherwise the funds are burnt (e.g. the destination was ejected).
     for t in &deferred {
-        if let Some(a) = accounts.get_mut(&t.dest) {
-            a.service.balance += t.amount;
+        if let Some(a) = exec.accounts.get_mut(&t.dest) {
+            a.balance += t.amount;
         }
     }
     // Update the last-accumulation slot for every accumulated service.
     for &s in &services {
-        if let Some(a) = accounts.get_mut(&s) {
-            a.service.last_accumulation_slot = input.slot;
+        if let Some(a) = exec.accounts.get_mut(&s) {
+            a.last_accumulation_slot = slot;
         }
     }
-    let n = acc_reports.len();
 
+    // Shift the accumulated ring buffer; the newest slot holds this block's
+    // accumulated package hashes.
+    let mut accd = accumulated_q.0.clone();
+    for i in 0..EPOCH - 1 {
+        accd[i] = accumulated_q.0[i + 1].clone();
+    }
+    let mut newest: Vec<H32> = acc_reports.iter().map(|r| r.package_spec.hash.clone()).collect();
+    newest.sort_by(|a, b| a.0.cmp(&b.0));
+    accd[EPOCH - 1] = newest.clone();
+    let newest_raw: Vec<[u8; 32]> = newest.iter().map(|h| h.0).collect();
+
+    // Rebuild the ready ring buffer (GP eq. finalstateaccumulation).
+    let gap = (slot - pre_slot) as usize;
+    let mut ready = ready_queue.0.clone();
+    for i in 0..EPOCH {
+        let idx = (m + EPOCH - i) % EPOCH;
+        ready[idx] = if i == 0 {
+            edit(&queued, &newest_raw).iter().map(pending_to_record).collect()
+        } else if i < gap {
+            Vec::new()
+        } else {
+            let old: Vec<Pending> = ready_queue.0[idx].iter().map(record_to_pending).collect();
+            edit(&old, &newest_raw).iter().map(pending_to_record).collect()
+        };
+    }
+
+    let root = if yields.is_empty() {
+        [0u8; 32]
+    } else {
+        accumulation_root(&yields)
+    };
+    AccCore {
+        exec,
+        stat_map,
+        ready: FixedSeq(ready),
+        accumulated: FixedSeq(accd),
+        root,
+    }
+}
+
+/// Apply the accumulate STF (typed `stf/accumulate` schema).
+pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
+    let exec = to_exec(&pre.accounts);
+    let core = accumulate_core(
+        input.slot,
+        pre.slot,
+        &pre.ready_queue,
+        &pre.accumulated,
+        &input.reports,
+        exec,
+    );
     let mut post = pre.clone();
     post.slot = input.slot;
-    post.accounts = accounts
-        .into_iter()
-        .map(|(id, data)| AccountsMapEntry { id, data })
-        .collect();
-    post.statistics = stat_map
+    post.accounts = to_typed(core.exec, &pre.accounts);
+    post.statistics = core
+        .stat_map
         .into_iter()
         .map(|(id, (count, gas))| ServiceStatEntry {
             id,
@@ -286,42 +350,60 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
             },
         })
         .collect();
+    post.ready_queue = core.ready;
+    post.accumulated = core.accumulated;
+    (Outcome::Ok(Hex(core.root)), post)
+}
 
-    // Shift the accumulated ring buffer; the newest slot holds this block's
-    // accumulated package hashes.
-    let mut accd = pre.accumulated.0.clone();
-    for i in 0..EPOCH - 1 {
-        accd[i] = pre.accumulated.0[i + 1].clone();
+/// Project typed accounts (`δ`) into the execution view: metadata map + the
+/// opaque state-key dictionary (storage under hashed keys, plus preimage blobs
+/// under their preimage keys so `code` can be resolved from the dict, exactly
+/// as on the unified trace path). `key_raw` remembers the raw storage key
+/// behind each hashed key for the reverse projection.
+fn to_exec(accounts: &[AccountsMapEntry]) -> ExecState {
+    let mut a = BTreeMap::new();
+    let mut dict = BTreeMap::new();
+    let mut key_raw = BTreeMap::new();
+    for e in accounts {
+        a.insert(e.id, e.data.service.clone());
+        for s in &e.data.storage {
+            let k = service_storage(e.id, &s.key.0);
+            dict.insert(k, s.value.0.clone());
+            key_raw.insert(k, (e.id, s.key.0.clone()));
+        }
+        for p in &e.data.preimage_blobs {
+            dict.insert(service_preimage(e.id, &p.hash.0), p.blob.0.clone());
+        }
     }
-    let mut newest: Vec<H32> = acc_reports.iter().map(|r| r.package_spec.hash.clone()).collect();
-    newest.sort_by(|a, b| a.0.cmp(&b.0));
-    accd[EPOCH - 1] = newest.clone();
-    post.accumulated = FixedSeq(accd);
-    let newest_raw: Vec<[u8; 32]> = newest.iter().map(|h| h.0).collect();
+    ExecState { accounts: a, dict, key_raw }
+}
 
-    // Rebuild the ready ring buffer (GP eq. finalstateaccumulation).
-    let gap = (input.slot - pre.slot) as usize;
-    let mut ready = pre.ready_queue.0.clone();
-    for i in 0..EPOCH {
-        let idx = (m + EPOCH - i) % EPOCH;
-        ready[idx] = if i == 0 {
-            edit(&queued, &newest_raw).iter().map(pending_to_record).collect()
-        } else if i < gap {
-            Vec::new()
-        } else {
-            let old: Vec<Pending> = pre.ready_queue.0[idx].iter().map(record_to_pending).collect();
-            edit(&old, &newest_raw).iter().map(pending_to_record).collect()
-        };
+/// Reconstruct typed accounts from the post-execution state. Storage is rebuilt
+/// from `key_raw` + `dict`; preimages/requests are carried through from the
+/// pre-state (the accumulate host-set does not mutate them).
+fn to_typed(state: ExecState, pre: &[AccountsMapEntry]) -> Vec<AccountsMapEntry> {
+    let ExecState { accounts, dict, key_raw } = state;
+    let mut out = Vec::new();
+    for (id, service) in accounts {
+        let mut storage: Vec<StorageMapEntry> = key_raw
+            .iter()
+            .filter(|(_, (svc, _))| *svc == id)
+            .filter_map(|(k, (_, raw))| {
+                dict.get(k).map(|v| StorageMapEntry { key: Blob(raw.clone()), value: Blob(v.clone()) })
+            })
+            .collect();
+        storage.sort_by(|x, y| x.key.0.cmp(&y.key.0));
+        let (preimage_blobs, preimage_requests) = pre
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.data.preimage_blobs.clone(), e.data.preimage_requests.clone()))
+            .unwrap_or_default();
+        out.push(AccountsMapEntry {
+            id,
+            data: ServiceAccount { service, storage, preimage_blobs, preimage_requests },
+        });
     }
-    post.ready_queue = FixedSeq(ready);
-
-    let root = if yields.is_empty() {
-        [0u8; 32]
-    } else {
-        accumulation_root(&yields)
-    };
-    let _ = n;
-    (Outcome::Ok(Hex(root)), post)
+    out
 }
 
 /// Map a work-execution result to the operand result (`Ok` blob or error code).
