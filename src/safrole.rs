@@ -244,7 +244,7 @@ fn z_sequence(tickets: &[TicketBody]) -> FixedSeq<TicketBody, EPOCH_LENGTH> {
 /// Fallback key sequence `F(r, k)` (GP eq. fallbackkeysequence): for each epoch
 /// slot, pick a validator by `LE(blake2b(r ‖ E4(i))[..4]) mod |k|` and take its
 /// bandersnatch key.
-fn fallback_keys(r: &[u8; 32], validators: &[ValidatorData]) -> FixedSeq<H32, EPOCH_LENGTH> {
+pub(crate) fn fallback_keys(r: &[u8; 32], validators: &[ValidatorData]) -> FixedSeq<H32, EPOCH_LENGTH> {
     let mut keys = Vec::with_capacity(EPOCH_LENGTH);
     for i in 0..EPOCH_LENGTH as u32 {
         let mut buf = r.to_vec();

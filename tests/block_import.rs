@@ -11,7 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use minimal_jam::block_import::{
-    next_auth_pools, next_entropy, next_recent_blocks, next_statistics, next_timeslot,
+    import_block, next_auth_pools, next_entropy, next_recent_blocks, next_statistics,
+    next_timeslot,
 };
 use jam_codec::Encode;
 use minimal_jam::hexutil::from_hex;
@@ -27,6 +28,7 @@ struct KeyVal {
 }
 #[derive(Deserialize)]
 struct Snapshot {
+    state_root: String,
     keyvals: Vec<KeyVal>,
 }
 #[derive(Deserialize)]
@@ -83,6 +85,13 @@ fn check_file(path: &Path) {
     // η (C6): entropy accumulator (bandersnatch VRF output).
     let eta = next_entropy(&sigma.entropy, sigma.timeslot, &t.block);
     assert_eq!(eta.encode(), *want(6), "{ctx}: η mismatch");
+
+    // Unified entry point: import_block must reproduce the entire posterior σ —
+    // every chapter (changed and carried-through) and the merklized root.
+    let post_sigma = import_block(&sigma, &t.block);
+    assert_eq!(post_sigma.serialize(), post, "{ctx}: T(σ') dictionary mismatch");
+    let root = format!("0x{}", hex::encode(post_sigma.root()));
+    assert_eq!(root, t.post_state.state_root.to_lowercase(), "{ctx}: σ' root mismatch");
 }
 
 /// Collect fallback trace files under `dir` (a directory that contains or is a
@@ -96,6 +105,7 @@ fn fallback_files(dir: &Path) -> Vec<PathBuf> {
             if p.is_dir() {
                 walk(&p, out);
             } else if p.extension().map(|x| x == "json").unwrap_or(false)
+                && p.file_stem().map(|s| s != "genesis").unwrap_or(false)
                 && p.components().any(|c| c.as_os_str() == "fallback")
             {
                 out.push(p);

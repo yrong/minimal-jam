@@ -230,6 +230,7 @@ pub type LastAccout = Vec<LastAccEntry>;
 ///
 /// Per-service dictionary entries (storage/preimage/request) are carried
 /// opaquely as `(state-key, value)` because their keys are one-way hashes.
+#[derive(Clone, Debug, PartialEq)]
 pub struct State {
     pub auth_pools: AuthPools,             // C(1) α
     pub auth_queues: AuthQueues,           // C(2) φ

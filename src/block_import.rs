@@ -13,18 +13,27 @@
 //! - η (C6): entropy accumulator — `η₀' = blake2b(η₀ ⌢ banderout(entropy_source))`
 //!   with epoch rotation. `banderout` is the Bandersnatch IETF VRF output hash
 //!   (`ark-vrf` 0.1.0), extracted from the signature's output point.
+//! - γ (C4) safrole, fallback path: on an epoch boundary with no winning
+//!   tickets, reseed the sealing keys from η₂' and reset the ticket accumulator
+//!   (validators steady → no ring-VRF recompute).
 //!
-//! Not yet wired (need later slices): γ (safrole ring VRF), reports-driven
-//! core/service statistics, disputes ψ, and the accumulation that produces the
-//! non-trivial β accumulation-output root.
+//! [`import_block`] composes these into a single `State → State` step and is
+//! verified byte-exact (`T(σ')` dictionary + state root) against the whole
+//! `traces/fallback` set (100 blocks, spanning epoch boundaries).
+//!
+//! Not yet wired (later slices): the safrole **ring-VRF ticket path** (winning
+//! tickets, `bad_ticket_proof`), work-report-driven core/service statistics,
+//! guarantees ρ, assurances, disputes ψ, and accumulation (the non-trivial β
+//! accumulation-output root). These fire on non-`fallback` traces.
 
 use crate::authorizations::MAX_POOL;
 use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::{blake2b_256, mmr_append, mmr_super_peak};
 use crate::history::MAX_HISTORY;
+use crate::safrole::fallback_keys;
 use crate::state::{
     AuthPools, AuthQueues, BlockInfo, EntropyBuffer, Mmr, RecentBlocks, ReportedWorkPackage,
-    Statistics, TimeSlot, ValidatorActivityRecord,
+    State, Statistics, TicketsOrKeys, TimeSlot, ValidatorActivityRecord,
 };
 use crate::types::{Block, EPOCH_LENGTH};
 use ark_serialize::CanonicalDeserialize;
@@ -197,4 +206,37 @@ pub fn next_entropy(pre: &EntropyBuffer, prior_slot: TimeSlot, block: &Block) ->
         vec![new0, pre.0[1].clone(), pre.0[2].clone(), pre.0[3].clone()]
     };
     FixedSeq(out)
+}
+
+/// Unified block-import entry point: apply the implemented block-level state
+/// transitions to `pre` under `block`, returning the posterior σ.
+///
+/// **Scope (this slice):** the crypto-light block chapters that fully determine
+/// no-work, no-epoch-boundary blocks — τ (C11), π (C13), α (C1), β (C3) with an
+/// empty accumulation-output root, and η (C6). All other chapters (γ safrole,
+/// ψ disputes, validator sets, ρ, accumulation queues, service accounts) are
+/// carried through unchanged. This reproduces the `fallback` traces byte-exact;
+/// epoch-boundary validator/safrole rotation and work-report-driven subsystems
+/// (guarantees ρ, assurances, accumulate) are later increments.
+pub fn import_block(pre: &State, block: &Block) -> State {
+    let prior_slot = pre.timeslot;
+    let mut post = pre.clone();
+    post.timeslot = next_timeslot(block);
+    post.statistics = next_statistics(&pre.statistics, prior_slot, block);
+    post.auth_pools = next_auth_pools(&pre.auth_pools, &pre.auth_queues, block);
+    // No work reports in scope → the accumulation-output root is the empty hash.
+    post.recent_blocks = next_recent_blocks(&pre.recent_blocks, block, [0u8; 32]);
+    post.entropy = next_entropy(&pre.entropy, prior_slot, block);
+
+    // γ (C4) safrole: on an epoch boundary with no winning tickets (fallback),
+    // reseed the epoch's sealing keys from η₂' and reset the ticket accumulator.
+    // Validators are steady in fallback, so γ_p / γ_z are carried through (no
+    // ring-VRF recompute).
+    let epoch_len = EPOCH_LENGTH as u32;
+    if block.header.slot / epoch_len > prior_slot / epoch_len {
+        post.safrole.tickets_or_keys =
+            TicketsOrKeys::Keys(fallback_keys(&post.entropy.0[2].0, &post.active_validators.0));
+        post.safrole.accumulator = Vec::new();
+    }
+    post
 }
