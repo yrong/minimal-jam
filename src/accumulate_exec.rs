@@ -290,9 +290,15 @@ pub fn run_service(
                 vm.advance_host();
             }
             ExitStatus::Halt => break,
+            ExitStatus::OutOfGas => {
+                // Out of gas: the machine runs instruction-by-instruction until
+                // the budget is exhausted, so the whole budget is consumed; the
+                // regular-context changes are discarded.
+                return AccOut { state: orig, gas_used: gas, yielded: None, transfers: Vec::new() };
+            }
             _ => {
-                // Panic/out-of-gas/fault: the exceptional dimension discards the
-                // regular-context changes (no checkpoint in the covered vectors).
+                // Panic/page-fault: gas consumed up to the trapping instruction;
+                // the regular-context changes are discarded.
                 return AccOut { state: orig, gas_used: gas - vm.gas, yielded: None, transfers: Vec::new() };
             }
         }
@@ -478,20 +484,16 @@ fn host(
             }
         }
         22 => {
-            // query(target=r7, hash_ptr=r8, length=r9): report a preimage
-            // request's status in r7 (count + first-slot<<32) and r8 (rest).
-            let s = if reg[7] == NONE { service } else { reg[7] as u32 };
-            let z = reg[9] as u32;
-            if !vm.memory.readable_range(reg[8] as u32, 32) {
+            // query(hash_ptr=r7, length=r8): report the caller's preimage
+            // request status in r7 (count + first-slot<<32) and r8 (rest).
+            let s = service;
+            let z = reg[8] as u32;
+            if !vm.memory.readable_range(reg[7] as u32, 32) {
                 vm.regs[7] = NONE;
                 return;
             }
             let mut h = [0u8; 32];
-            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
-            if !state.accounts.contains_key(&s) {
-                vm.regs[7] = WHO;
-                return;
-            }
+            h.copy_from_slice(&vm.memory.load(reg[7] as u32, 32));
             match state.dict.get(&service_request(s, z, &h)).map(|b| decode_status(b)) {
                 None => {
                     vm.regs[7] = NONE;
@@ -505,19 +507,15 @@ fn host(
             }
         }
         23 => {
-            // solicit(target=r7, hash_ptr=r8, length=r9): request a preimage.
-            let d = if reg[7] == NONE { service } else { reg[7] as u32 };
-            let z = reg[9] as u32;
-            if !vm.memory.readable_range(reg[8] as u32, 32) {
+            // solicit(hash_ptr=r7, length=r8): request a preimage for the caller.
+            let d = service;
+            let z = reg[8] as u32;
+            if !vm.memory.readable_range(reg[7] as u32, 32) {
                 vm.regs[7] = NONE;
                 return;
             }
             let mut h = [0u8; 32];
-            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
-            if !state.accounts.contains_key(&d) {
-                vm.regs[7] = WHO;
-                return;
-            }
+            h.copy_from_slice(&vm.memory.load(reg[7] as u32, 32));
             let rk = service_request(d, z, &h);
             match state.dict.get(&rk).map(|b| decode_status(b)) {
                 None => {
@@ -537,19 +535,15 @@ fn host(
             }
         }
         24 => {
-            // forget(target=r7, hash_ptr=r8, length=r9): drop a preimage request.
-            let d = if reg[7] == NONE { service } else { reg[7] as u32 };
-            let z = reg[9] as u32;
-            if !vm.memory.readable_range(reg[8] as u32, 32) {
+            // forget(hash_ptr=r7, length=r8): drop the caller's preimage request.
+            let d = service;
+            let z = reg[8] as u32;
+            if !vm.memory.readable_range(reg[7] as u32, 32) {
                 vm.regs[7] = NONE;
                 return;
             }
             let mut h = [0u8; 32];
-            h.copy_from_slice(&vm.memory.load(reg[8] as u32, 32));
-            if !state.accounts.contains_key(&d) {
-                vm.regs[7] = WHO;
-                return;
-            }
+            h.copy_from_slice(&vm.memory.load(reg[7] as u32, 32));
             let rk = service_request(d, z, &h);
             let drop_request = |state: &mut ExecState| {
                 state.dict.remove(&rk);
