@@ -15,10 +15,10 @@ const I: u64 = 1 << 24; // init input size
 const P: u64 = 4096; // page
 /// Per-storage-item octet overhead (GP service footprint).
 const ITEM_OVERHEAD: u64 = 34;
-const NONE: u64 = u64::MAX;
-const WHO: u64 = u64::MAX - 1;
-const HUH: u64 = u64::MAX - 3;
-const CASH: u64 = u64::MAX - 5;
+const NONE: u64 = u64::MAX; // 2^64 - 1
+const WHO: u64 = u64::MAX - 3; // 2^64 - 4
+const HUH: u64 = u64::MAX - 8; // 2^64 - 9
+const CASH: u64 = u64::MAX - 6; // 2^64 - 7
 
 /// A deferred balance transfer emitted by `transfer`, applied after all
 /// services have accumulated (credited to the destination if it still exists,
