@@ -31,11 +31,17 @@ use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::{blake2b_256, mmr_append, mmr_super_peak};
 use crate::history::MAX_HISTORY;
 use crate::safrole::{transition as safrole_step, Input as SafroleStfIn, State as SafroleStf};
+use crate::assurances::{transition as assurances_step, Input as AssurancesIn, State as AssurancesStf};
+use crate::disputes::{transition as disputes_step, Input as DisputesIn, State as DisputesStf};
+use crate::reports::{
+    transition as reports_step, Account as RepAccount, AccountsMapEntry as RepAccountEntry,
+    Input as ReportsIn, State as ReportsStf,
+};
 use crate::state::{
     AuthPools, AuthQueues, BlockInfo, EntropyBuffer, Mmr, RecentBlocks, ReportedWorkPackage,
-    SafroleState, State, Statistics, TimeSlot, ValidatorActivityRecord,
+    SafroleState, ServiceInfo, State, Statistics, TimeSlot, ValidatorActivityRecord,
 };
-use crate::types::{Block, EPOCH_LENGTH};
+use crate::types::{Block, EPOCH_LENGTH, H32};
 use ark_serialize::CanonicalDeserialize;
 use ark_vrf::suites::bandersnatch::Output as VrfOutput;
 use jam_codec::Encode;
@@ -262,5 +268,95 @@ pub fn import_block(pre: &State, block: &Block) -> State {
         tickets_or_keys: sf.gamma_s,
         accumulator: sf.gamma_a,
     };
+
+    // --- Availability half (GP §10/§11) ------------------------------------
+    // ρ (C10) evolves through three subsystems, each a function of the prior
+    // state σ: disputes clear judged assignments (ρ†), assurances clear the
+    // available/timed-out ones (ρ‡), guarantees add newly-reported ones (ρ').
+    // ψ (C5) and the core/service halves of π (C13) update alongside.
+    let (_dout, disp) = disputes_step(
+        &DisputesStf {
+            psi: pre.disputes.clone(),
+            rho: pre.avail.clone(),
+            tau: pre.timeslot,
+            kappa: pre.active_validators.clone(),
+            lambda: pre.previous_validators.clone(),
+        },
+        &DisputesIn { disputes: block.extrinsic.disputes.clone() },
+    );
+    post.disputes = disp.psi;
+    let rho_dagger = disp.rho;
+
+    let (_aout, asr) = assurances_step(
+        &AssurancesStf {
+            avail_assignments: rho_dagger,
+            curr_validators: post.active_validators.clone(),
+        },
+        &AssurancesIn {
+            assurances: block.extrinsic.assurances.clone(),
+            slot: block.header.slot,
+            parent: block.header.parent.clone(),
+        },
+    );
+    let rho_ddagger = asr.avail_assignments;
+
+    // Reports validate report anchors against recent history β with the parent
+    // block's posterior state root back-filled (β†): the pre-state's last entry
+    // still carries a placeholder until this block's β update runs.
+    let mut beta_dagger = pre.recent_blocks.clone();
+    if let Some(last) = beta_dagger.history.last_mut() {
+        last.state_root = block.header.parent_state_root.clone();
+    }
+
+    let (_rout, rep) = reports_step(
+        &ReportsStf {
+            avail_assignments: rho_ddagger,
+            curr_validators: post.active_validators.clone(),
+            prev_validators: post.previous_validators.clone(),
+            entropy: post.entropy.clone(),
+            offenders: post.disputes.offenders.clone(),
+            recent_blocks: beta_dagger,
+            auth_pools: pre.auth_pools.clone(),
+            accounts: avail_accounts(&pre.accounts),
+            cores_statistics: post.statistics.cores.clone(),
+            services_statistics: post.statistics.services.clone(),
+        },
+        &ReportsIn {
+            guarantees: block.extrinsic.guarantees.clone(),
+            slot: block.header.slot,
+            known_packages: known_packages(pre),
+        },
+    );
+    post.avail = rep.avail_assignments;
+    post.statistics.cores = rep.cores_statistics;
+    post.statistics.services = rep.services_statistics;
     post
+}
+
+/// Project the unified service accounts into the reports STF's metadata-only
+/// view (`Account { service }`); storage/preimages are irrelevant to C11.
+fn avail_accounts(accounts: &[(u32, ServiceInfo)]) -> Vec<RepAccountEntry> {
+    accounts
+        .iter()
+        .map(|(id, info)| RepAccountEntry {
+            id: *id,
+            data: RepAccount { service: info.clone() },
+        })
+        .collect()
+}
+
+/// Work-package hashes already known — the accumulated set ξ (C15) plus the
+/// ready queue ϑ (C14). The reports STF rejects any guarantee whose package is
+/// already known (or present in recent history β, which it checks itself).
+fn known_packages(pre: &State) -> Vec<H32> {
+    let mut out = Vec::new();
+    for slot in &pre.accumulated.0 {
+        out.extend(slot.iter().cloned());
+    }
+    for slot in &pre.ready.0 {
+        for r in slot {
+            out.push(r.report.package_spec.hash.clone());
+        }
+    }
+    out
 }

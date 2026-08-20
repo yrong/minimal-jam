@@ -154,3 +154,43 @@ fn external_traces_import() {
         eprintln!("block-import verified for {} {category} traces", files.len());
     }
 }
+
+/// Temporary probe: on work-report traces the availability-owned chapters
+/// (ψ=C5, ρ=C10) must match even though accumulate chapters (C3 root, C12,
+/// C13-services, C14/15/16, δ) do not yet.
+#[test]
+fn avail_half_probe() {
+    let Ok(dir) = std::env::var("JAM_TRACES_DIR") else { return };
+    let dir = Path::new(&dir);
+    for category in ["storage_light", "storage", "preimages_light", "fuzzy_light"] {
+        let files = trace_files(dir, category);
+        assert!(!files.is_empty(), "no {category} traces");
+        let mut hist: std::collections::BTreeMap<u8, usize> = Default::default();
+        for f in &files {
+            let t: Trace = serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap();
+            let pre_entries: Vec<(StateKey, Vec<u8>)> = t
+                .pre_state
+                .keyvals
+                .iter()
+                .map(|kv| (key31(&kv.key), from_hex(&kv.value)))
+                .collect();
+            let sigma = State::from_entries(&pre_entries).unwrap();
+            let post: BTreeMap<StateKey, Vec<u8>> = t
+                .post_state
+                .keyvals
+                .iter()
+                .map(|kv| (key31(&kv.key), from_hex(&kv.value)))
+                .collect();
+            let got = import_block(&sigma, &t.block).serialize();
+            for k in got.keys().chain(post.keys()) {
+                if got.get(k) != post.get(k) {
+                    *hist.entry(k[0]).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("{category}: differing-chapter histogram: {hist:?}");
+        for c in [5u8, 10] {
+            assert!(!hist.contains_key(&c), "{category}: chapter {c} differs (avail half broke)");
+        }
+    }
+}
