@@ -58,3 +58,35 @@ pub fn vrf_output_hash(signature: &[u8]) -> [u8; 32] {
     y.copy_from_slice(&bytes[..32]);
     y
 }
+
+/// Verify a Bandersnatch RingVRF signature against a ring commitment `γ_z`.
+///
+/// `signature` is the JAM ticket proof: a 32-byte compressed VRF output point
+/// followed by the ring proof. `input_data` is the VRF input pre-image and
+/// `aux` the (empty, for tickets) additional data. Returns `true` iff the proof
+/// verifies under the ring committed by `commitment`.
+pub fn ring_verify(commitment: &[u8; 144], input_data: &[u8], aux: &[u8], signature: &[u8]) -> bool {
+    use ark_vrf::suites::bandersnatch::{BandersnatchSha512Ell2, Input, RingCommitment, RingProof};
+
+    if signature.len() < 32 {
+        return false;
+    }
+    let Ok(commit) = RingCommitment::deserialize_compressed(&commitment[..]) else {
+        return false;
+    };
+    let Some(input) = Input::new(input_data) else {
+        return false;
+    };
+    let Ok(output) = Output::deserialize_compressed(&signature[..32]) else {
+        return false;
+    };
+    let Ok(proof) = RingProof::deserialize_compressed(&signature[32..]) else {
+        return false;
+    };
+    let vk = PARAMS.verifier_key_from_commitment(commit);
+    let verifier = PARAMS.verifier(vk);
+    <Public as ark_vrf::ring::Verifier<BandersnatchSha512Ell2>>::verify(
+        input, output, aux, &proof, &verifier,
+    )
+    .is_ok()
+}

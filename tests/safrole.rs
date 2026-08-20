@@ -51,12 +51,12 @@ fn safrole_epoch_change_vectors() {
 
 #[test]
 fn safrole_ticket_vectors() {
-    // Ticket submission: id extraction, validity (attempt/order/duplicate/tail),
-    // accumulator merge, winning-tickets marker, and Z(γ_a) sealing on epoch
-    // change. `publish-tickets-no-mark-5` (bad_ticket_proof) is omitted: it needs
-    // ring-proof verification, which is not yet reproduced.
+    // Ticket submission: RingVRF proof verification, id extraction, validity
+    // (attempt/order/duplicate/tail), accumulator merge, winning-tickets marker,
+    // and Z(γ_a) sealing on epoch change.
     run("publish-tickets-no-mark-1"); // bad_ticket_attempt
     run("publish-tickets-no-mark-2"); // ok: 0 -> 3 accumulated
+    run("publish-tickets-no-mark-5"); // bad_ticket_proof (invalid ring proof)
     run("publish-tickets-no-mark-3"); // duplicate_ticket
     run("publish-tickets-no-mark-4"); // bad_ticket_order
     run("publish-tickets-no-mark-6"); // ok: 3 -> 6 accumulated

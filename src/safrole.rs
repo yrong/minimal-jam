@@ -11,7 +11,7 @@
 
 use crate::bytes::{FixedSeq, Hex};
 use crate::crypto::blake2b_256;
-use crate::ring::{ring_commitment, vrf_output_hash};
+use crate::ring::{ring_commitment, ring_verify, vrf_output_hash};
 use crate::state::{TicketBody, TicketsOrKeys, ValidatorData};
 use crate::types::{
     EpochMark, EpochMarkValidatorKeys, TicketEnvelope, EPOCH_LENGTH, H144, H32, VALIDATORS_COUNT,
@@ -108,7 +108,7 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
 
         let mut gamma_a = pre.gamma_a.clone();
         if !input.extrinsic.is_empty() {
-            match validate_tickets(&input.extrinsic, &gamma_a) {
+            match validate_tickets(&input.extrinsic, &gamma_a, &pre.gamma_z.0, &pre.eta.0[2].0) {
                 Ok(mut news) => {
                     gamma_a.append(&mut news);
                     gamma_a.sort_by(|a, b| a.id.0.cmp(&b.id.0));
@@ -170,7 +170,7 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         if m_cur >= TAIL_START {
             return (Outcome::Err(SafroleError::UnexpectedTicket), pre.clone());
         }
-        match validate_tickets(&input.extrinsic, &gamma_a) {
+        match validate_tickets(&input.extrinsic, &gamma_a, &gamma_z.0, &eta.0[2].0) {
             Ok(mut news) => {
                 gamma_a.append(&mut news);
                 gamma_a.sort_by(|a, b| a.id.0.cmp(&b.id.0));
@@ -212,15 +212,25 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
 }
 
 /// Validate a non-empty tickets extrinsic against the current accumulator and
-/// extract the resulting ticket bodies. The ring-proof itself is not verified.
+/// extract the resulting ticket bodies. Each ticket's Bandersnatch RingVRF
+/// proof is verified against the epoch's ring commitment `γ_z` over the input
+/// `$jam_ticket_seal ‖ η'₂ ‖ attempt`; the id is the proof's VRF output.
 fn validate_tickets(
     extrinsic: &[TicketEnvelope],
     accumulator: &[TicketBody],
+    ring_z: &[u8; 144],
+    eta2: &[u8; 32],
 ) -> Result<Vec<TicketBody>, SafroleError> {
     let mut news = Vec::with_capacity(extrinsic.len());
     for env in extrinsic {
         if env.attempt >= MAX_ATTEMPTS {
             return Err(SafroleError::BadTicketAttempt);
+        }
+        let mut input = b"jam_ticket_seal".to_vec();
+        input.extend_from_slice(eta2);
+        input.push(env.attempt);
+        if !ring_verify(ring_z, &input, &[], &env.signature.0) {
+            return Err(SafroleError::BadTicketProof);
         }
         news.push(TicketBody {
             id: Hex(vrf_output_hash(&env.signature.0)),
