@@ -790,14 +790,16 @@ fn write_out(vm: &mut Vm, data: Option<Vec<u8>>) {
 /// Layout: code_hash(32) ‖ balance(8) ‖ threshold(8) ‖ min_item_gas(8) ‖
 /// min_memo_gas(8) ‖ octets(8) ‖ items(4) ‖ gratis(8) ‖ created(4) ‖
 /// last_acc(4) ‖ parent(4). `threshold` is the minimum balance implied by the
-/// storage footprint: `B_S + B_I·items + B_L·octets`.
+/// storage footprint less any `gratis` credit: `max(0, B_S + B_I·items +
+/// B_L·octets − gratis)`.
 fn encode_info(s: &crate::state::ServiceInfo) -> Vec<u8> {
     // Deposit constants (mirror `protocol_params`): base per account, per item,
     // per byte.
     const B_S: u64 = 100;
     const B_I: u64 = 10;
     const B_L: u64 = 1;
-    let threshold = B_S + B_I * s.items as u64 + B_L * s.bytes;
+    let footprint = B_S + B_I * s.items as u64 + B_L * s.bytes;
+    let threshold = footprint.saturating_sub(s.deposit_offset);
     let mut v = Vec::with_capacity(96);
     v.extend_from_slice(&s.code_hash.0); // 32
     v.extend_from_slice(&s.balance.to_le_bytes()); // 8

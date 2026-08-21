@@ -230,3 +230,45 @@ fn c16_probe() {
     eprintln!("C16 ref  ({}): {:?}", refr.len(),
         refr.iter().map(|e| (e.service, hex::encode(&e.hash.0[..6]))).collect::<Vec<_>>());
 }
+
+/// Probe: across fuzzy_light traces, decode C13 (statistics) and report which
+/// service/core activity records differ, field by field, for the first few
+/// diverging blocks. Gated on JAM_TRACES_DIR.
+#[test]
+fn stats_probe() {
+    let Ok(dir) = std::env::var("JAM_TRACES_DIR") else { return };
+    let files = trace_files(Path::new(&dir), "fuzzy_light");
+    let mut shown = 0;
+    for f in &files {
+        let t: Trace = serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap();
+        let pre: Vec<(StateKey, Vec<u8>)> = t.pre_state.keyvals.iter()
+            .map(|kv| (key31(&kv.key), from_hex(&kv.value))).collect();
+        let sigma = State::from_entries(&pre).unwrap();
+        let post = State::from_entries(&t.post_state.keyvals.iter()
+            .map(|kv| (key31(&kv.key), from_hex(&kv.value))).collect::<Vec<_>>()).unwrap();
+        let mine = import_block(&sigma, &t.block);
+        let ms = &mine.statistics;
+        let ps = &post.statistics;
+        if ms.services == ps.services && ms.cores == ps.cores {
+            continue;
+        }
+        if shown >= 4 { break; }
+        shown += 1;
+        let name = f.file_name().unwrap().to_string_lossy();
+        eprintln!("--- {name} ---");
+        let mine_svc: BTreeMap<u32, _> = ms.services.iter().map(|e| (e.id, &e.record)).collect();
+        let ref_svc: BTreeMap<u32, _> = ps.services.iter().map(|e| (e.id, &e.record)).collect();
+        for id in mine_svc.keys().chain(ref_svc.keys()).copied().collect::<std::collections::BTreeSet<_>>() {
+            let m = mine_svc.get(&id);
+            let r = ref_svc.get(&id);
+            if m.map(|x| *x) != r.map(|x| *x) {
+                eprintln!("  svc {id}: mine={m:?} ref={r:?}");
+            }
+        }
+        for (i, (mc, rc)) in ms.cores.0.iter().zip(ps.cores.0.iter()).enumerate() {
+            if mc != rc {
+                eprintln!("  core {i}: mine={mc:?} ref={rc:?}");
+            }
+        }
+    }
+}

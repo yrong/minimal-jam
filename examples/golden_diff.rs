@@ -147,14 +147,28 @@ fn main() {
     let acc_in = fs::read(format!("{gdir}/accumulate_input")).expect("golden accumulate_input");
     let (op_count, off) = read_compact(&acc_in);
     assert_eq!(op_count, count, "operand count mismatch input vs accumulate_input");
-    // For the common single-operand case, the remainder is exactly one encoded
-    // operand; this matches what `fetch` 14 (compact(count) ‖ concat) returns.
-    let encoded_operands: Vec<Vec<u8>> = if count == 1 {
-        vec![acc_in[off..].to_vec()]
-    } else {
-        eprintln!("note: {count} operands; feeding whole blob as a single operand (fetch 15 may differ)");
-        vec![acc_in[off..].to_vec()]
-    };
+    // Split the concatenated operands (fetch 14 returns compact(count) ‖ each
+    // encoded operand). Each operand is:
+    //   tag(1) ‖ 4×hash(128) ‖ compact(gas) ‖ result ‖ compact(auth_len) ‖ auth
+    // where result = 0x00 ‖ compact(len) ‖ blob   (Ok)  |  err_code(1) (Err).
+    let mut encoded_operands: Vec<Vec<u8>> = Vec::new();
+    let mut pos = off;
+    for _ in 0..count {
+        let start = pos;
+        pos += 1 + 128; // tag + four hashes
+        let (_, n) = read_compact(&acc_in[pos..]);
+        pos += n; // gas_limit
+        let rtag = acc_in[pos];
+        pos += 1; // result tag
+        if rtag == 0 {
+            let (blen, n) = read_compact(&acc_in[pos..]);
+            pos += n + blen as usize; // Ok blob
+        }
+        let (alen, an) = read_compact(&acc_in[pos..]);
+        pos += an + alen as usize; // auth trace
+        encoded_operands.push(acc_in[start..pos].to_vec());
+    }
+    assert_eq!(pos, acc_in.len(), "operand split did not consume the whole blob");
 
     // Entropy = posterior η'_0 (first 32 bytes of chapter 6), overridable.
     let entropy = match std::env::var("ENTROPY") {
