@@ -280,6 +280,7 @@ pub fn run_service(
     service: u32,
     gas: i64,
     operands: &[Operand],
+    entropy: &[u8; 32],
     state: ExecState,
 ) -> AccOut {
     let args = acc_args(slot, service, operands.len() as u32);
@@ -289,7 +290,11 @@ pub fn run_service(
     let Some(mut vm) = Vm::new(&pvm, 5, gas, regs, memory) else {
         return AccOut { state, gas_used: 0, yielded: None, transfers: Vec::new() };
     };
-    let orig = state.clone();
+    // Checkpoint rollback point (GP `checkpoint`): initially the pre-invocation
+    // context; updated when the service calls checkpoint (host 17).
+    let mut cp_state = state.clone();
+    let mut cp_yielded: Option<[u8; 32]> = None;
+    let mut cp_transfers: Vec<Transfer> = Vec::new();
     let mut ctx = state;
     let mut yielded: Option<[u8; 32]> = None;
     let mut transfers: Vec<Transfer> = Vec::new();
@@ -298,20 +303,24 @@ pub fn run_service(
     loop {
         match vm.run() {
             ExitStatus::HostCall(n) => {
-                host(n, &mut vm, service, slot, &mut ctx, &encoded_operands, &mut yielded, &mut transfers);
+                host(n, &mut vm, service, slot, &mut ctx, &encoded_operands, &mut yielded, &mut transfers, entropy);
                 vm.advance_host();
+                if n == 17 {
+                    cp_state = ctx.clone();
+                    cp_yielded = yielded;
+                    cp_transfers = transfers.clone();
+                }
             }
             ExitStatus::Halt => break,
             ExitStatus::OutOfGas => {
-                // Out of gas: the machine runs instruction-by-instruction until
-                // the budget is exhausted, so the whole budget is consumed; the
-                // regular-context changes are discarded.
-                return AccOut { state: orig, gas_used: gas, yielded: None, transfers: Vec::new() };
+                // Out of gas: the whole budget is consumed; roll back to the
+                // last checkpoint (pre-invocation if none).
+                return AccOut { state: cp_state, gas_used: gas, yielded: cp_yielded, transfers: cp_transfers };
             }
             _ => {
-                // Panic/page-fault: gas consumed up to the trapping instruction;
-                // the regular-context changes are discarded.
-                return AccOut { state: orig, gas_used: gas - vm.gas, yielded: None, transfers: Vec::new() };
+                // Panic/page-fault: gas consumed to the trap; roll back to the
+                // last checkpoint.
+                return AccOut { state: cp_state, gas_used: gas - vm.gas, yielded: cp_yielded, transfers: cp_transfers };
             }
         }
     }
@@ -328,6 +337,7 @@ fn host(
     operands: &[Vec<u8>],
     yielded: &mut Option<[u8; 32]>,
     transfers: &mut Vec<Transfer>,
+    entropy: &[u8; 32],
 ) {
     // Host-call gas (tiny test model): a flat 10 per host call, except a memo
     // `transfer`, which additionally reserves its destination's `on_transfer`
@@ -343,6 +353,7 @@ fn host(
             // fetch(buffer=r7, offset=r8, buffer_len=r9, kind=r10, a=r11, b=r12)
             let data: Option<Vec<u8>> = match reg[10] {
                 0 => Some(protocol_params()),
+                1 => Some(entropy.to_vec()),
                 14 => {
                     let mut all = compact(operands.len() as u64);
                     for o in operands {
@@ -677,6 +688,11 @@ fn host(
             }
             state.staging = FixedSeq(v);
             vm.regs[7] = 0;
+        }
+        17 => {
+            // checkpoint: return remaining gas; the run loop snapshots the
+            // accumulation context as the panic-rollback point.
+            vm.regs[7] = vm.gas as u64;
         }
         _ => {
             vm.regs[7] = HUH;

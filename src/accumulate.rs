@@ -184,6 +184,7 @@ pub fn accumulate_core(
     ready_queue: &ReadyQueue,
     accumulated_q: &AccumulatedQueue,
     reports: &[WorkReport],
+    entropy: [u8; 32],
     mut exec: ExecState,
 ) -> AccCore {
     let m = slot as usize % EPOCH;
@@ -280,7 +281,7 @@ pub fn accumulate_core(
             .map(|a| a.code_hash.0)
             .and_then(|ch| exec.dict.get(&service_preimage(s, &ch)).cloned())
             .unwrap_or_default();
-        let out = run_service(&code, slot, s, gas_s, &operands, exec);
+        let out = run_service(&code, slot, s, gas_s, &operands, &entropy, exec);
         exec = out.state;
         stat_map.insert(s, (count, out.gas_used as u64));
         if let Some(h) = out.yielded {
@@ -352,6 +353,7 @@ pub fn transition(pre: &State, input: &Input) -> (Outcome, State) {
         &pre.ready_queue,
         &pre.accumulated,
         &input.reports,
+        pre.entropy.0,
         exec,
     );
     let mut post = pre.clone();

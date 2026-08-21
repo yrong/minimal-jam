@@ -392,6 +392,7 @@ pub fn import_block(pre: &State, block: &Block) -> State {
         &pre.ready,
         &pre.accumulated,
         &available,
+        post.entropy.0[0].0,
         exec,
     );
     let ExecState {
