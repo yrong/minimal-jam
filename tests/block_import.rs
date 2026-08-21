@@ -272,3 +272,35 @@ fn stats_probe() {
         }
     }
 }
+
+/// Probe: compare C255 service accounts (mine vs post) across fuzzy_light and
+/// report the diverging services and fields for the first few blocks. Gated on
+/// JAM_TRACES_DIR.
+#[test]
+fn accounts_probe() {
+    let Ok(dir) = std::env::var("JAM_TRACES_DIR") else { return };
+    let files = trace_files(Path::new(&dir), "fuzzy_light");
+    let mut shown = 0;
+    for f in &files {
+        let t: Trace = serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap();
+        let pre: Vec<(StateKey, Vec<u8>)> = t.pre_state.keyvals.iter()
+            .map(|kv| (key31(&kv.key), from_hex(&kv.value))).collect();
+        let sigma = State::from_entries(&pre).unwrap();
+        let post = State::from_entries(&t.post_state.keyvals.iter()
+            .map(|kv| (key31(&kv.key), from_hex(&kv.value))).collect::<Vec<_>>()).unwrap();
+        let mine = import_block(&sigma, &t.block);
+        let ma: BTreeMap<u32, _> = mine.accounts.iter().cloned().collect();
+        let pa: BTreeMap<u32, _> = post.accounts.iter().cloned().collect();
+        if ma == pa { continue; }
+        if shown >= 5 { break; }
+        shown += 1;
+        eprintln!("--- {} ---", f.file_name().unwrap().to_string_lossy());
+        for id in ma.keys().chain(pa.keys()).copied().collect::<std::collections::BTreeSet<_>>() {
+            let m = ma.get(&id);
+            let r = pa.get(&id);
+            if m != r {
+                eprintln!("  svc {id}:\n    mine={m:?}\n    ref ={r:?}");
+            }
+        }
+    }
+}
