@@ -385,6 +385,7 @@ pub fn import_block(pre: &State, block: &Block) -> State {
         privileges: pre.privileges.clone(),
         auth_queues: pre.auth_queues.clone(),
         staging: post.staging_validators.clone(),
+        next_free_id: 0,
     };
     let core = accumulate_core(
         block.header.slot,

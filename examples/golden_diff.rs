@@ -125,6 +125,7 @@ fn main() {
         },
         auth_queues: FixedSeq(Vec::new()),
         staging: FixedSeq(Vec::new()),
+        next_free_id: 0,
     };
 
     // --- Service code = preimage of the account's code hash. ---

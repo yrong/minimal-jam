@@ -49,6 +49,9 @@ pub struct ExecState {
     pub auth_queues: AuthQueues,
     /// ι (C7) staging validator set — mutated by `designate`.
     pub staging: ValidatorSet,
+    /// The service-creation counter (`im¬nextfreeid`): the next id `new` will
+    /// assign, initialised per accumulate invocation from (service, η'₀, slot).
+    pub next_free_id: u32,
 }
 
 /// Result of running one service's accumulate logic.
@@ -307,6 +310,32 @@ fn trace_push(vm: &Vm, pc: u32, op: u8) {
     });
 }
 
+/// Minimum public service index (`C_minpublicindex` = 2^16). Ids below it are
+/// reserved for the registrar.
+const MIN_PUBLIC_INDEX: u32 = 1 << 16;
+/// Service-id sequence modulus: `2^32 - 2^8 - 2^16`.
+const ID_MOD: u64 = (1u64 << 32) - (1 << 8) - (1 << 16);
+
+/// The seed id for `new` within a service's accumulation (I): derived from the
+/// creating service, the posterior entropy accumulator, and the block slot.
+fn first_free_id(service: u32, entropy: &[u8; 32], slot: u32) -> u32 {
+    let mut pre = compact(service as u64);
+    pre.extend_from_slice(entropy);
+    pre.extend_from_slice(&compact(slot as u64));
+    let h = blake2b_256(&pre);
+    let v = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as u64;
+    ((v % ID_MOD) + MIN_PUBLIC_INDEX as u64) as u32
+}
+
+/// `check` (GP eq. newserviceindex): the first id in the sequence not already
+/// a live account.
+fn check_id(mut i: u32, accounts: &BTreeMap<u32, ServiceInfo>) -> u32 {
+    while accounts.contains_key(&i) {
+        i = (((i as u64 - MIN_PUBLIC_INDEX as u64 + 1) % ID_MOD) + MIN_PUBLIC_INDEX as u64) as u32;
+    }
+    i
+}
+
 /// Run one service's accumulate logic.
 pub fn run_service(
     code: &[u8],
@@ -340,12 +369,15 @@ pub fn run_service_raw(
     let Some(mut vm) = Vm::new(&pvm, 5, gas, regs, memory) else {
         return AccOut { state, gas_used: 0, yielded: None, transfers: Vec::new() };
     };
+    let mut ctx = state;
+    // Initialise the service-creation counter (I): the first id `new` yields is
+    // check(le_u32(blake2b(compact(s) ‖ η'₀ ‖ compact(t))) mod MOD + MINPUB).
+    ctx.next_free_id = check_id(first_free_id(service, entropy, slot), &ctx.accounts);
     // Checkpoint rollback point (GP `checkpoint`): initially the pre-invocation
     // context; updated when the service calls checkpoint (host 17).
-    let mut cp_state = state.clone();
+    let mut cp_state = ctx.clone();
     let mut cp_yielded: Option<[u8; 32]> = None;
     let mut cp_transfers: Vec<Transfer> = Vec::new();
-    let mut ctx = state;
     let mut yielded: Option<[u8; 32]> = None;
     let mut transfers: Vec<Transfer> = Vec::new();
 
@@ -763,6 +795,59 @@ fn host(
             // checkpoint: return remaining gas; the run loop snapshots the
             // accumulation context as the panic-rollback point.
             vm.regs[7] = vm.gas as u64;
+        }
+        18 => {
+            // new(code_hash_ptr=r7, code_len=r8, min_item_gas=r9,
+            //     min_memo_gas=r10, gratis=r11, desired_id=r12) -> new id.
+            let (chp, l, minaccgas, minmemogas, gratis) =
+                (reg[7], reg[8], reg[9], reg[10], reg[11]);
+            let desired = reg[12] as u32;
+            if !vm.memory.readable_range(chp as u32, 32) {
+                vm.regs[7] = NONE;
+                return;
+            }
+            let mut code_hash = [0u8; 32];
+            code_hash.copy_from_slice(&vm.memory.load(chp as u32, 32));
+            // Registrar may claim a low desired id; otherwise take the sequence
+            // id and advance the counter for any later `new` in this invocation.
+            let id = if service == state.privileges.registrar && desired < MIN_PUBLIC_INDEX {
+                desired
+            } else {
+                state.next_free_id
+            };
+            let bumped = ((state.next_free_id as u64 - MIN_PUBLIC_INDEX as u64 + 42) % ID_MOD
+                + MIN_PUBLIC_INDEX as u64) as u32;
+            state.next_free_id = check_id(bumped, &state.accounts);
+            // The new account holds one code-preimage request: footprint is
+            // 2 items and (81 + code_len) octets; minbalance funds it.
+            let items = 2u32;
+            let bytes = 81 + l;
+            let minbalance = 100 + 10 * items as u64 + bytes;
+            state.accounts.insert(
+                id,
+                ServiceInfo {
+                    version: 0,
+                    code_hash: Hex(code_hash),
+                    balance: minbalance,
+                    min_item_gas: minaccgas,
+                    min_memo_gas: minmemogas,
+                    bytes,
+                    deposit_offset: gratis,
+                    items,
+                    creation_slot: slot,
+                    last_accumulation_slot: 0,
+                    parent_service: service,
+                },
+            );
+            // Empty request status ([]) for the code preimage of (code_hash, l).
+            state
+                .dict
+                .insert(service_request(id, l as u32, &code_hash), vec![0u8]);
+            // Fund the new service from the creator's balance.
+            if let Some(a) = state.accounts.get_mut(&service) {
+                a.balance = a.balance.saturating_sub(minbalance);
+            }
+            vm.regs[7] = id as u64;
         }
         _ => {
             vm.regs[7] = HUH;

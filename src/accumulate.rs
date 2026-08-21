@@ -411,6 +411,7 @@ fn to_exec(accounts: &[AccountsMapEntry]) -> ExecState {
         },
         auth_queues: FixedSeq(Vec::new()),
         staging: FixedSeq(Vec::new()),
+        next_free_id: 0,
     }
 }
 
