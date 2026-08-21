@@ -3,9 +3,13 @@
 //! Runs a service's `accumulate` logic in the PVM with the accumulate host-call
 //! subset, then reports the mutated accounts, gas used, and yielded output.
 
-use crate::state::ServiceInfo;
+use crate::state::{
+    AlwaysAccEntry, AuthQueues, Privileges, ServiceInfo, ValidatorData, ValidatorSet,
+};
 use crate::state_key::{key_service, service_preimage, service_request, service_storage, StateKey};
-use crate::bytes::Hex;
+use crate::bytes::{FixedSeq, Hex};
+use crate::types::{AUTH_QUEUE_SIZE, CORE_COUNT, VALIDATORS_COUNT};
+use jam_codec::Decode;
 use crate::crypto::blake2b_256;
 use crate::pvm::{ExitStatus, Memory, Vm};
 use std::collections::BTreeMap;
@@ -19,6 +23,7 @@ const NONE: u64 = u64::MAX; // 2^64 - 1
 const WHO: u64 = u64::MAX - 3; // 2^64 - 4
 const HUH: u64 = u64::MAX - 8; // 2^64 - 9
 const CASH: u64 = u64::MAX - 6; // 2^64 - 7
+const CORE: u64 = u64::MAX - 5; // 2^64 - 6
 
 /// A deferred balance transfer emitted by `transfer`, applied after all
 /// services have accumulated (credited to the destination if it still exists,
@@ -33,11 +38,17 @@ pub struct Transfer {
 /// state-key dictionary (storage/preimages/requests). `key_raw` records the raw
 /// storage key behind each hashed storage state-key so the typed accumulate STF
 /// post-state can be reconstructed; it is irrelevant to the trace path.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ExecState {
     pub accounts: BTreeMap<u32, ServiceInfo>,
     pub dict: BTreeMap<StateKey, Vec<u8>>,
     pub key_raw: BTreeMap<StateKey, (u32, Vec<u8>)>,
+    /// χ (C12) privileges — mutated by `bless`/`assign`.
+    pub privileges: Privileges,
+    /// φ (C2) authorizer queues — mutated by `assign`.
+    pub auth_queues: AuthQueues,
+    /// ι (C7) staging validator set — mutated by `designate`.
+    pub staging: ValidatorSet,
 }
 
 /// Result of running one service's accumulate logic.
@@ -573,6 +584,99 @@ fn host(
                 }
                 _ => vm.regs[7] = HUH,
             }
+        }
+        14 => {
+            // bless(manager=r7, assign_ptr=r8, delegator=r9, registrar=r10,
+            // always_ptr=r11, always_count=r12): set χ privileges. Caller must
+            // be the current manager.
+            if service != state.privileges.manager {
+                vm.regs[7] = HUH;
+                return;
+            }
+            let a_ptr = reg[8] as u32;
+            let o = reg[11] as u32;
+            let nn = reg[12] as usize;
+            if !vm.memory.readable_range(a_ptr, 4 * CORE_COUNT as u64)
+                || !vm.memory.readable_range(o, 12 * nn as u64)
+            {
+                vm.regs[7] = HUH;
+                return;
+            }
+            let mut assign = Vec::with_capacity(CORE_COUNT);
+            for c in 0..CORE_COUNT as u32 {
+                let b = vm.memory.load(a_ptr + 4 * c, 4);
+                assign.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+            let mut always = Vec::with_capacity(nn);
+            for i in 0..nn as u32 {
+                let b = vm.memory.load(o + 12 * i, 12);
+                let id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                let gas = u64::from_le_bytes([b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]]);
+                always.push(AlwaysAccEntry { id, gas });
+            }
+            state.privileges = Privileges {
+                manager: reg[7] as u32,
+                assign: FixedSeq(assign),
+                delegator: reg[9] as u32,
+                registrar: reg[10] as u32,
+                always_acc: always,
+            };
+            vm.regs[7] = 0;
+        }
+        15 => {
+            // assign(core=r7, queue_ptr=r8, service=r9): set φ authorizer queue
+            // for a core and the core's assign privilege. Caller must be the
+            // current assigner of that core.
+            let c = reg[7] as usize;
+            if c >= CORE_COUNT {
+                vm.regs[7] = CORE;
+                return;
+            }
+            if service != state.privileges.assign.0[c] {
+                vm.regs[7] = HUH;
+                return;
+            }
+            let o = reg[8] as u32;
+            if !vm.memory.readable_range(o, 32 * AUTH_QUEUE_SIZE as u64) {
+                vm.regs[7] = HUH;
+                return;
+            }
+            let mut q = Vec::with_capacity(AUTH_QUEUE_SIZE);
+            for i in 0..AUTH_QUEUE_SIZE as u32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&vm.memory.load(o + 32 * i, 32));
+                q.push(Hex(h));
+            }
+            state.auth_queues.0[c] = FixedSeq(q);
+            state.privileges.assign.0[c] = reg[9] as u32;
+            vm.regs[7] = 0;
+        }
+        16 => {
+            // designate(ptr=r7, count=r8): set ι staging validator keys. Caller
+            // must be the current delegator; count must equal the validator count.
+            let z = reg[8] as usize;
+            if z != VALIDATORS_COUNT || service != state.privileges.delegator {
+                vm.regs[7] = HUH;
+                return;
+            }
+            let o = reg[7] as u32;
+            if !vm.memory.readable_range(o, 336 * z as u64) {
+                vm.regs[7] = HUH;
+                return;
+            }
+            let mut v = Vec::with_capacity(z);
+            for i in 0..z as u32 {
+                let b = vm.memory.load(o + 336 * i, 336);
+                match ValidatorData::decode(&mut &b[..]) {
+                    Ok(vd) => v.push(vd),
+                    Err(_) => {
+                        vm.regs[7] = HUH;
+                        return;
+                    }
+                }
+            }
+            state.staging = FixedSeq(v);
+            vm.regs[7] = 0;
         }
         _ => {
             vm.regs[7] = HUH;

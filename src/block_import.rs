@@ -382,6 +382,9 @@ pub fn import_block(pre: &State, block: &Block) -> State {
         accounts: pre.accounts.iter().cloned().collect(),
         dict: pre.service_dict.iter().cloned().collect::<BTreeMap<StateKey, Vec<u8>>>(),
         key_raw: BTreeMap::new(),
+        privileges: pre.privileges.clone(),
+        auth_queues: pre.auth_queues.clone(),
+        staging: post.staging_validators.clone(),
     };
     let core = accumulate_core(
         block.header.slot,
@@ -391,10 +394,21 @@ pub fn import_block(pre: &State, block: &Block) -> State {
         &available,
         exec,
     );
-    let ExecState { accounts: acc_out, dict: mut service_dict, .. } = core.exec;
+    let ExecState {
+        accounts: acc_out,
+        dict: mut service_dict,
+        privileges: post_privileges,
+        auth_queues: post_auth_queues,
+        staging: post_staging,
+        ..
+    } = core.exec;
     post.accounts = acc_out.into_iter().collect();
     post.ready = core.ready;
     post.accumulated = core.accumulated;
+    // χ (C12), φ (C2), ι (C7) — mutated by bless/assign/designate.
+    post.privileges = post_privileges;
+    post.auth_queues = post_auth_queues;
+    post.staging_validators = post_staging;
     merge_accumulate_stats(&mut post.statistics.services, &core.stat_map);
     // C16: this block's accumulation-output log (service, yielded hash).
     post.last_accout = core

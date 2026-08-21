@@ -234,6 +234,19 @@ pub fn accumulate_core(
             }
         }
     }
+    // Always-accumulate (privileged) services run every block with a gas grant,
+    // even with no work reports. Snapshot the grant map from the prior χ.
+    let always: Vec<(u32, i64)> = exec
+        .privileges
+        .always_acc
+        .iter()
+        .map(|e| (e.id, e.gas as i64))
+        .collect();
+    for &(id, _) in &always {
+        if !services.contains(&id) {
+            services.push(id);
+        }
+    }
     let mut stat_map: BTreeMap<u32, (u32, u64)> = BTreeMap::new();
     let mut yields: Vec<(u32, [u8; 32])> = Vec::new();
     let mut deferred: Vec<crate::accumulate_exec::Transfer> = Vec::new();
@@ -257,6 +270,8 @@ pub fn accumulate_core(
                 });
             }
         }
+        // Privileged services get their always-accumulate gas grant on top.
+        gas_s += always.iter().find(|(id, _)| *id == s).map(|(_, g)| *g).unwrap_or(0);
         let count = operands.len() as u32;
         // Resolve the service code from its preimage in the state-key dict.
         let code = exec
@@ -379,14 +394,29 @@ fn to_exec(accounts: &[AccountsMapEntry]) -> ExecState {
             dict.insert(service_preimage(e.id, &p.hash.0), p.blob.0.clone());
         }
     }
-    ExecState { accounts: a, dict, key_raw }
+    ExecState {
+        accounts: a,
+        dict,
+        key_raw,
+        // The accumulate STF vectors have empty χ.always_acc and make no
+        // privilege host calls, so an empty privilege context is exact here.
+        privileges: crate::state::Privileges {
+            manager: 0,
+            assign: FixedSeq(vec![0u32; CORE_COUNT]),
+            delegator: 0,
+            registrar: 0,
+            always_acc: Vec::new(),
+        },
+        auth_queues: FixedSeq(Vec::new()),
+        staging: FixedSeq(Vec::new()),
+    }
 }
 
 /// Reconstruct typed accounts from the post-execution state. Storage is rebuilt
 /// from `key_raw` + `dict`; preimages/requests are carried through from the
 /// pre-state (the accumulate host-set does not mutate them).
 fn to_typed(state: ExecState, pre: &[AccountsMapEntry]) -> Vec<AccountsMapEntry> {
-    let ExecState { accounts, dict, key_raw } = state;
+    let ExecState { accounts, dict, key_raw, .. } = state;
     let mut out = Vec::new();
     for (id, service) in accounts {
         let mut storage: Vec<StorageMapEntry> = key_raw
