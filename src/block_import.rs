@@ -43,8 +43,8 @@ use crate::reports::{
     Input as ReportsIn, State as ReportsStf,
 };
 use crate::state::{
-    AuthPools, AuthQueues, BlockInfo, CoreActivityRecord, EntropyBuffer, Mmr, RecentBlocks,
-    ReportedWorkPackage,
+    AuthPools, AuthQueues, BlockInfo, CoreActivityRecord, EntropyBuffer, LastAccEntry, Mmr,
+    RecentBlocks, ReportedWorkPackage,
     SafroleState, ServiceActivityRecord, ServiceInfo, ServiceStatEntry, State, Statistics,
     TimeSlot, ValidatorActivityRecord,
 };
@@ -396,6 +396,12 @@ pub fn import_block(pre: &State, block: &Block) -> State {
     post.ready = core.ready;
     post.accumulated = core.accumulated;
     merge_accumulate_stats(&mut post.statistics.services, &core.stat_map);
+    // C16: this block's accumulation-output log (service, yielded hash).
+    post.last_accout = core
+        .yields
+        .iter()
+        .map(|(s, h)| LastAccEntry { service: *s, hash: Hex(*h) })
+        .collect();
 
     // Preimage provision (GP §12): store each provided blob under its preimage
     // state-key, stamp the matching request with this slot, and advance the

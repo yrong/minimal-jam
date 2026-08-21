@@ -173,6 +173,9 @@ pub struct AccCore {
     pub ready: ReadyQueue,
     pub accumulated: AccumulatedQueue,
     pub root: [u8; 32],
+    /// Per-service accumulation outputs (service id, 32-byte yielded hash),
+    /// in accumulation order — the block's C16 last-accumulation log.
+    pub yields: Vec<(u32, [u8; 32])>,
 }
 
 pub fn accumulate_core(
@@ -321,6 +324,7 @@ pub fn accumulate_core(
         ready: FixedSeq(ready),
         accumulated: FixedSeq(accd),
         root,
+        yields,
     }
 }
 
