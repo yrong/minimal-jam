@@ -194,3 +194,39 @@ fn avail_half_probe() {
         }
     }
 }
+
+/// Focused probe: decode C16 (last-accout) for my import_block output vs the
+/// trace post-state, to characterise the divergence (missing/extra/wrong-hash).
+/// Gated on JAM_TRACE_FILE.
+#[test]
+fn c16_probe() {
+    use jam_codec::Decode;
+    use minimal_jam::state::LastAccEntry;
+    let Ok(file) = std::env::var("JAM_TRACE_FILE") else { return };
+    let t: Trace = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let pre_entries: Vec<(StateKey, Vec<u8>)> = t
+        .pre_state
+        .keyvals
+        .iter()
+        .map(|kv| (key31(&kv.key), from_hex(&kv.value)))
+        .collect();
+    let sigma = State::from_entries(&pre_entries).unwrap();
+    let post: BTreeMap<StateKey, Vec<u8>> = t
+        .post_state
+        .keyvals
+        .iter()
+        .map(|kv| (key31(&kv.key), from_hex(&kv.value)))
+        .collect();
+    let got = import_block(&sigma, &t.block).serialize();
+    let ck = chapter(16);
+    let dec = |b: &[u8]| -> Vec<LastAccEntry> {
+        let mut s = b;
+        Vec::<LastAccEntry>::decode(&mut s).unwrap_or_default()
+    };
+    let mine = got.get(&ck).map(|v| dec(v)).unwrap_or_default();
+    let refr = post.get(&ck).map(|v| dec(v)).unwrap_or_default();
+    eprintln!("C16 mine ({}): {:?}", mine.len(),
+        mine.iter().map(|e| (e.service, hex::encode(&e.hash.0[..6]))).collect::<Vec<_>>());
+    eprintln!("C16 ref  ({}): {:?}", refr.len(),
+        refr.iter().map(|e| (e.service, hex::encode(&e.hash.0[..6]))).collect::<Vec<_>>());
+}

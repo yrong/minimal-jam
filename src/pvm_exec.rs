@@ -7,6 +7,8 @@ fn exit_action(e: ExitStatus) -> Action {
         ExitStatus::OutOfGas => Action::Panic,
         ExitStatus::Halt => Action::Halt,
         ExitStatus::HostCall(id) => Action::HostCall(id),
+        // `Running` is produced only by `Vm::step`; `execute` never yields it.
+        ExitStatus::Running => Action::Panic,
     }
 }
 

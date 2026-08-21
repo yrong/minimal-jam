@@ -250,7 +250,7 @@ fn protocol_params() -> Vec<u8> {
     e(5, 2); // availability_timeout
     e(6, 2); // val_count
     e(64_000, 4); // max_authorizer_code_size
-    e(13_791_360, 4); // max_input
+    e(13_794_360, 4); // max_input (WB, GP-exact; verified against jamduna golden)
     e(4_000_000, 4); // max_service_code_size
     e(4, 4); // basic_piece_len
     e(3_072, 4); // max_imports
@@ -273,6 +273,40 @@ pub struct Operand {
     pub result: Result<Vec<u8>, u8>,
 }
 
+/// Per-instruction trace captured by `run_service` when tracing is armed, used
+/// by the golden-trace diff harness. One row per executed instruction, with the
+/// pc *before* the step and the register/gas snapshot *after* it (host-call rows
+/// fold in the host mutation, matching the jamduna golden stream convention).
+#[derive(Clone, Debug)]
+pub struct TraceRow {
+    pub pc: u32,
+    pub op: u8,
+    pub regs: [u64; crate::pvm::REG_COUNT],
+    pub gas: i64,
+}
+
+thread_local! {
+    static TRACE: std::cell::RefCell<Option<Vec<TraceRow>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Arm per-instruction tracing for the next `run_service` on this thread.
+pub fn trace_start() {
+    TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarm tracing and take the recorded rows.
+pub fn trace_take() -> Vec<TraceRow> {
+    TRACE.with(|t| t.borrow_mut().take().unwrap_or_default())
+}
+
+fn trace_push(vm: &Vm, pc: u32, op: u8) {
+    TRACE.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            v.push(TraceRow { pc, op, regs: vm.regs, gas: vm.gas });
+        }
+    });
+}
+
 /// Run one service's accumulate logic.
 pub fn run_service(
     code: &[u8],
@@ -283,7 +317,23 @@ pub fn run_service(
     entropy: &[u8; 32],
     state: ExecState,
 ) -> AccOut {
-    let args = acc_args(slot, service, operands.len() as u32);
+    let encoded: Vec<Vec<u8>> = operands.iter().map(encode_operand).collect();
+    run_service_raw(code, slot, service, gas, encoded, entropy, state)
+}
+
+/// Run one service's accumulate logic with operands supplied already encoded
+/// (as `fetch` 14/15 would return them). Used both by `run_service` and by the
+/// golden-trace diff harness, which feeds the reference `accumulate_input`.
+pub fn run_service_raw(
+    code: &[u8],
+    slot: u32,
+    service: u32,
+    gas: i64,
+    encoded_operands: Vec<Vec<u8>>,
+    entropy: &[u8; 32],
+    state: ExecState,
+) -> AccOut {
+    let args = acc_args(slot, service, encoded_operands.len() as u32);
     let Some((pvm, regs, memory, _a, _b)) = spi(code, &args) else {
         return AccOut { state, gas_used: 0, yielded: None, transfers: Vec::new() };
     };
@@ -298,20 +348,40 @@ pub fn run_service(
     let mut ctx = state;
     let mut yielded: Option<[u8; 32]> = None;
     let mut transfers: Vec<Transfer> = Vec::new();
-    let encoded_operands: Vec<Vec<u8>> = operands.iter().map(encode_operand).collect();
 
+    // Step one instruction at a time so an armed trace sink can record every
+    // row. Gas is still charged per basic block (via `Vm::step`'s block-entry
+    // charge), so behaviour is identical to the block-at-a-time `Vm::run` path.
     loop {
-        match vm.run() {
+        let pc = vm.pc;
+        let (op, st) = vm.step();
+        match st {
+            ExitStatus::Running => trace_push(&vm, pc, op),
             ExitStatus::HostCall(n) => {
                 host(n, &mut vm, service, slot, &mut ctx, &encoded_operands, &mut yielded, &mut transfers, entropy);
                 vm.advance_host();
+                // Record the `ecalli` row after the host mutation, matching the
+                // golden stream (register snapshot after the step).
+                trace_push(&vm, pc, op);
                 if n == 17 {
                     cp_state = ctx.clone();
                     cp_yielded = yielded;
                     cp_transfers = transfers.clone();
                 }
             }
-            ExitStatus::Halt => break,
+            ExitStatus::Halt => {
+                // GP Ψ_M/C: on a normal halt the invocation output is the blob
+                // memory[r7..r7+r8]. A 32-byte output is the accumulation yield
+                // (taking precedence over any `yield` host call); other lengths
+                // leave the host-call yield in place.
+                let (o, len) = (vm.regs[7], vm.regs[8]);
+                if len == 32 && vm.memory.readable_range(o as u32, 32) {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&vm.memory.load(o as u32, 32));
+                    yielded = Some(h);
+                }
+                break;
+            }
             ExitStatus::OutOfGas => {
                 // Out of gas: the whole budget is consumed; roll back to the
                 // last checkpoint (pre-invocation if none).
@@ -714,15 +784,32 @@ fn write_out(vm: &mut Vm, data: Option<Vec<u8>>) {
     }
 }
 
-/// Encode service info for the `info` host call.
+/// Encode service info for the `info` host call (GP Ω_I, 0.7.2 layout, 96 bytes;
+/// verified byte-exact against jamduna golden traces).
+///
+/// Layout: code_hash(32) ‖ balance(8) ‖ threshold(8) ‖ min_item_gas(8) ‖
+/// min_memo_gas(8) ‖ octets(8) ‖ items(4) ‖ gratis(8) ‖ created(4) ‖
+/// last_acc(4) ‖ parent(4). `threshold` is the minimum balance implied by the
+/// storage footprint: `B_S + B_I·items + B_L·octets`.
 fn encode_info(s: &crate::state::ServiceInfo) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend_from_slice(&s.code_hash.0);
-    v.extend_from_slice(&s.balance.to_le_bytes());
-    v.extend_from_slice(&s.min_item_gas.to_le_bytes());
-    v.extend_from_slice(&s.min_memo_gas.to_le_bytes());
-    v.extend_from_slice(&s.bytes.to_le_bytes());
-    v.extend_from_slice(&(s.items).to_le_bytes());
+    // Deposit constants (mirror `protocol_params`): base per account, per item,
+    // per byte.
+    const B_S: u64 = 100;
+    const B_I: u64 = 10;
+    const B_L: u64 = 1;
+    let threshold = B_S + B_I * s.items as u64 + B_L * s.bytes;
+    let mut v = Vec::with_capacity(96);
+    v.extend_from_slice(&s.code_hash.0); // 32
+    v.extend_from_slice(&s.balance.to_le_bytes()); // 8
+    v.extend_from_slice(&threshold.to_le_bytes()); // 8 (minbalance)
+    v.extend_from_slice(&s.min_item_gas.to_le_bytes()); // 8
+    v.extend_from_slice(&s.min_memo_gas.to_le_bytes()); // 8
+    v.extend_from_slice(&s.bytes.to_le_bytes()); // 8 (octets)
+    v.extend_from_slice(&s.items.to_le_bytes()); // 4
+    v.extend_from_slice(&s.deposit_offset.to_le_bytes()); // 8 (gratis)
+    v.extend_from_slice(&s.creation_slot.to_le_bytes()); // 4 (created)
+    v.extend_from_slice(&s.last_accumulation_slot.to_le_bytes()); // 4 (lastacc)
+    v.extend_from_slice(&s.parent_service.to_le_bytes()); // 4 (parent)
     v
 }
 

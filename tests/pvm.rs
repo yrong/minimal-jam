@@ -54,6 +54,7 @@ fn status_str(s: ExitStatus) -> &'static str {
         ExitStatus::OutOfGas => "out-of-gas",
         ExitStatus::PageFault(_) => "page-fault",
         ExitStatus::HostCall(_) => "host-call",
+        ExitStatus::Running => "running",
     }
 }
 

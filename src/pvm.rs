@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const PAGE_SIZE: u64 = 4096;
 const DYN_ALIGN: u64 = 2;
 const HALT_ADDR: u64 = 0xffff_0000;
-const REG_COUNT: usize = 13;
+pub const REG_COUNT: usize = 13;
 
 /// Reason a PVM execution stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +19,8 @@ pub enum ExitStatus {
     OutOfGas,
     PageFault(u32),
     HostCall(u64),
+    /// Emitted only by `step`: a normal instruction completed, keep stepping.
+    Running,
 }
 
 /// An accessible memory region for the initial page map.
@@ -374,6 +376,11 @@ pub struct Vm {
     pub regs: [u64; REG_COUNT],
     pub memory: Memory,
     gas_charged: bool,
+    /// Total instruction gas of the current basic block, and how much of it has
+    /// been charged so far (per instruction). On a mid-block trap the untouched
+    /// remainder is charged, so a trap consumes the whole block.
+    blk_cost: i64,
+    blk_spent: i64,
 }
 
 impl Vm {
@@ -386,6 +393,8 @@ impl Vm {
             regs,
             memory,
             gas_charged: false,
+            blk_cost: 0,
+            blk_spent: 0,
         })
     }
 
@@ -393,33 +402,9 @@ impl Vm {
     /// `ecalli`; call `advance_host` after handling it, then resume.
     pub fn run(&mut self) -> ExitStatus {
         loop {
-            let i = self.pc as usize;
-            if !self.gas_charged {
-                let cost = block_gas_cost(&self.program, block_start_of(&self.program, i));
-                if self.gas < cost {
-                    return ExitStatus::OutOfGas;
-                }
-                self.gas -= cost;
-                self.gas_charged = true;
-            }
-            let op = zeta(&self.program.code, i);
-            let ell = skip(&self.program.bitmask, i);
-            let next = (i + 1 + ell) as u32;
-            match execute(&self.program, op, i, ell, &mut self.regs, &mut self.memory) {
-                Action::Next => {
-                    self.pc = next;
-                    if is_terminator(op) {
-                        self.gas_charged = false;
-                    }
-                }
-                Action::Jump(target) => {
-                    self.pc = target;
-                    self.gas_charged = false;
-                }
-                Action::Halt => return ExitStatus::Halt,
-                Action::Panic => return ExitStatus::Panic,
-                Action::PageFault(a) => return ExitStatus::PageFault(a),
-                Action::HostCall(id) => return ExitStatus::HostCall(id),
+            match self.step() {
+                (_, ExitStatus::Running) => {}
+                (_, status) => return status,
             }
         }
     }
@@ -429,6 +414,58 @@ impl Vm {
     pub fn advance_host(&mut self) {
         let i = self.pc as usize;
         self.pc = (i + 1 + skip(&self.program.bitmask, i)) as u32;
+    }
+
+    /// Execute exactly one instruction. Returns the opcode that ran and the
+    /// resulting status. On `HostCall`/`Halt`/`Panic`/`PageFault` the pc is left
+    /// at the current instruction (as in `run`); on a normal step pc/regs are
+    /// already advanced. Used by the golden per-instruction trace harness.
+    pub fn step(&mut self) -> (u8, ExitStatus) {
+        let i = self.pc as usize;
+        if !self.gas_charged {
+            // Basic-block gas gate (GP Appendix A): the whole block must be
+            // affordable before any of it runs. Gas is deducted per instruction
+            // below (so the counter matches the reference step by step); a trap
+            // charges the block's untouched remainder so the total still equals
+            // the block cost, matching the PVM conformance vectors.
+            let cost = block_gas_cost(&self.program, block_start_of(&self.program, i));
+            if self.gas < cost {
+                return (0, ExitStatus::OutOfGas);
+            }
+            self.blk_cost = cost;
+            self.blk_spent = 0;
+            self.gas_charged = true;
+        }
+        self.gas -= 1;
+        self.blk_spent += 1;
+        let op = zeta(&self.program.code, i);
+        let ell = skip(&self.program.bitmask, i);
+        let next = (i + 1 + ell) as u32;
+        let charge_block_remainder = |vm: &mut Vm| vm.gas -= vm.blk_cost - vm.blk_spent;
+        match execute(&self.program, op, i, ell, &mut self.regs, &mut self.memory) {
+            Action::Next => {
+                self.pc = next;
+                if is_terminator(op) {
+                    self.gas_charged = false;
+                }
+                (op, ExitStatus::Running)
+            }
+            Action::Jump(target) => {
+                self.pc = target;
+                self.gas_charged = false;
+                (op, ExitStatus::Running)
+            }
+            Action::Halt => (op, ExitStatus::Halt),
+            Action::Panic => {
+                charge_block_remainder(self);
+                (op, ExitStatus::Panic)
+            }
+            Action::PageFault(a) => {
+                charge_block_remainder(self);
+                (op, ExitStatus::PageFault(a))
+            }
+            Action::HostCall(id) => (op, ExitStatus::HostCall(id)),
+        }
     }
 }
 
