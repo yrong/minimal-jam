@@ -110,19 +110,28 @@ fn main() {
         }
         dict.insert(k, v);
     }
+    // Load χ (C12) privileges from the pre-state so permissioned host calls
+    // (bless/assign/designate, registrar `new`) behave as in the real STF.
+    let privileges = {
+        let mut k = [0u8; 31];
+        k[0] = 12;
+        dict.get(&k)
+            .and_then(|b| Privileges::decode(&mut &b[..]).ok())
+            .unwrap_or(Privileges {
+                manager: 0,
+                assign: FixedSeq(vec![0u32; CORE_COUNT]),
+                delegator: 0,
+                registrar: 0,
+                always_acc: Vec::new(),
+            })
+    };
     // read()/preimage lookups recompute the same hashed key, so the raw dict is
     // a faithful storage backend.
     let exec = ExecState {
         accounts: accounts.clone(),
         dict: dict.clone(),
         key_raw: BTreeMap::new(),
-        privileges: Privileges {
-            manager: 0,
-            assign: FixedSeq(vec![0u32; CORE_COUNT]),
-            delegator: 0,
-            registrar: 0,
-            always_acc: Vec::new(),
-        },
+        privileges,
         auth_queues: FixedSeq(Vec::new()),
         staging: FixedSeq(Vec::new()),
         next_free_id: 0,
