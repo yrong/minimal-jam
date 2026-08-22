@@ -30,8 +30,11 @@ const CORE: u64 = u64::MAX - 5; // 2^64 - 6
 /// otherwise burnt).
 #[derive(Clone)]
 pub struct Transfer {
+    pub source: u32,
     pub dest: u32,
     pub amount: u64,
+    pub gas: u64,
+    pub memo: [u8; 128],
 }
 
 /// Service state visible to accumulate: per-service metadata plus the opaque
@@ -216,6 +219,19 @@ fn encode_operand(op: &Operand) -> Vec<u8> {
     // auth_output (AuthTrace): compact-len blob.
     v.extend_from_slice(&compact(op.auth_trace.len() as u64));
     v.extend_from_slice(&op.auth_trace);
+    v
+}
+
+/// Encode a deferred transfer as a `fetch` operand (tag 1): source ‖ dest ‖
+/// amount ‖ memo(128) ‖ gas. Consumed by a recipient service re-accumulating.
+pub fn encode_defxfer(t: &Transfer) -> Vec<u8> {
+    let mut v = Vec::with_capacity(153);
+    v.push(1); // enum tag: Transfer = 1
+    v.extend_from_slice(&t.source.to_le_bytes());
+    v.extend_from_slice(&t.dest.to_le_bytes());
+    v.extend_from_slice(&t.amount.to_le_bytes());
+    v.extend_from_slice(&t.memo);
+    v.extend_from_slice(&t.gas.to_le_bytes());
     v
 }
 
@@ -441,10 +457,10 @@ fn host(
     transfers: &mut Vec<Transfer>,
     entropy: &[u8; 32],
 ) {
-    // Host-call gas (tiny test model): a flat 10 per host call, except a memo
-    // `transfer`, which additionally reserves its destination's `on_transfer`
-    // gas limit (r9). The `ecalli` instruction itself is charged with its block.
-    vm.gas -= if n == 20 { 10 + vm.regs[9] as i64 } else { 10 };
+    // Host-call gas (tiny test model): a flat 10 per host call. A deferred memo
+    // `transfer` additionally reserves its destination's gas limit, charged in
+    // the arm. The `ecalli` instruction itself is charged with its block.
+    vm.gas -= 10;
     let reg = vm.regs;
     match n {
         0 => {
@@ -570,20 +586,36 @@ fn host(
             }
         }
         20 => {
-            // transfer(dest=r7, amount=r8, gas_limit=r9, memo_ptr=r10): deduct
-            // the caller's balance now and record a deferred transfer, credited
-            // to the destination after all services accumulate (GP Ω_T).
+            // transfer(dest=r7, amount=r8, gas=r9, memo_ptr=r10) (GP Ω_T). With
+            // no memo (o=0) the transfer is immediate: credit the destination
+            // now. With a memo it is deferred, reserving the destination's gas
+            // limit, and the destination re-accumulates with the memo operand.
             let dest = reg[7] as u32;
             let amount = reg[8];
+            let gas_l = reg[9];
+            let memo_ptr = reg[10] as u32;
             if !state.accounts.contains_key(&dest) {
                 vm.regs[7] = WHO;
             } else if state.accounts.get(&service).is_none_or(|a| a.balance < amount) {
                 vm.regs[7] = CASH;
-            } else {
+            } else if memo_ptr == 0 {
                 if let Some(me) = state.accounts.get_mut(&service) {
                     me.balance -= amount;
                 }
-                transfers.push(Transfer { dest, amount });
+                if let Some(d) = state.accounts.get_mut(&dest) {
+                    d.balance += amount;
+                }
+                vm.regs[7] = 0;
+            } else if !vm.memory.readable_range(memo_ptr, 128) {
+                vm.regs[7] = NONE;
+            } else {
+                vm.gas -= gas_l as i64; // reserve the destination's accumulate gas
+                if let Some(me) = state.accounts.get_mut(&service) {
+                    me.balance -= amount;
+                }
+                let mut memo = [0u8; 128];
+                memo.copy_from_slice(&vm.memory.load(memo_ptr, 128));
+                transfers.push(Transfer { source: service, dest, amount, gas: gas_l, memo });
                 vm.regs[7] = 0;
             }
         }

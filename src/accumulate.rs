@@ -20,7 +20,7 @@
 //!   than honouring `checkpoint`; privileges (`χ`) and always-accumulate are
 //!   carried through unchanged.
 
-use crate::accumulate_exec::{run_service, ExecState, Operand};
+use crate::accumulate_exec::{encode_defxfer, run_service, run_service_raw, ExecState, Operand};
 use crate::state_key::{service_preimage, service_storage};
 use crate::bytes::{Blob, FixedSeq, Hex};
 use crate::state::{
@@ -289,15 +289,52 @@ pub fn accumulate_core(
         }
         deferred.extend(out.transfers);
     }
-    // Apply deferred transfers: credit the destination if it still exists,
-    // otherwise the funds are burnt (e.g. the destination was ejected).
-    for t in &deferred {
-        if let Some(a) = exec.accounts.get_mut(&t.dest) {
-            a.balance += t.amount;
+    // Deferred transfers (GP Ψ_A/Ω_T): credit each destination and re-run its
+    // accumulate with the transfers as `defxfer` operands, in ordered rounds
+    // (a recipient may itself emit further transfers). Destinations that no
+    // longer exist have their funds burnt.
+    let mut accumulated_ids: std::collections::BTreeSet<u32> = services.iter().copied().collect();
+    let mut pending = deferred;
+    let mut round_guard = 0;
+    while !pending.is_empty() && round_guard < 16 {
+        round_guard += 1;
+        let mut by_dest: BTreeMap<u32, Vec<crate::accumulate_exec::Transfer>> = BTreeMap::new();
+        for t in pending.drain(..) {
+            by_dest.entry(t.dest).or_default().push(t);
+        }
+        for (dest, xfers) in by_dest {
+            if !exec.accounts.contains_key(&dest) {
+                continue; // burnt
+            }
+            let credit: u64 = xfers.iter().map(|t| t.amount).sum();
+            if let Some(a) = exec.accounts.get_mut(&dest) {
+                a.balance += credit;
+            }
+            let encoded: Vec<Vec<u8>> = xfers.iter().map(encode_defxfer).collect();
+            let gas_s: i64 = xfers.iter().map(|t| t.gas as i64).sum();
+            let code = exec
+                .accounts
+                .get(&dest)
+                .map(|a| a.code_hash.0)
+                .and_then(|ch| exec.dict.get(&service_preimage(dest, &ch)).cloned())
+                .unwrap_or_default();
+            let out = run_service_raw(&code, slot, dest, gas_s, encoded, &entropy, exec);
+            exec = out.state;
+            // A recipient that consumed no gas (empty code / immediate halt) did
+            // not really accumulate: the reference records neither a statistics
+            // entry nor a last-accumulation update for it.
+            if out.gas_used > 0 {
+                stat_map.entry(dest).or_insert((0, 0)).1 += out.gas_used as u64;
+                accumulated_ids.insert(dest);
+            }
+            if let Some(h) = out.yielded {
+                yields.push((dest, h));
+            }
+            pending.extend(out.transfers);
         }
     }
     // Update the last-accumulation slot for every accumulated service.
-    for &s in &services {
+    for &s in &accumulated_ids {
         if let Some(a) = exec.accounts.get_mut(&s) {
             a.last_accumulation_slot = slot;
         }
